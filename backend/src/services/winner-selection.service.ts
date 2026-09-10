@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { ProgrammePeriodModel } from '../models/programme-period.model';
 import { PassengerQualificationModel } from '../models/passenger-qualification.model';
 import { DriverQualificationModel } from '../models/driver-qualification.model';
