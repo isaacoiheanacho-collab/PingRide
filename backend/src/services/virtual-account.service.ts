@@ -9,54 +9,72 @@ import {
     IBankTransferEvent
 } from '../types/payment.types';
 import logger from '../utils/logger';
+import pool from '../config/database';
 
 export class VirtualAccountService {
 
     /**
-     * Provision a virtual account for a passenger
-     * Enhanced with split support for commission sharing
-     * 
-     * @param userId - The user ID to provision the account for
-     * @param options - Optional configuration including split_code and subaccount
-     * @returns The created virtual account
+     * Provision a virtual account for a passenger.
+     *
+     * Phase 2A flow:
+     *   1. POST /customer                     → customer_code
+     *   2. POST /customer/{code}/identification (BVN + bank) → 202 Accepted
+     *   3. POST /dedicated_account            → DVA number (Wema Bank)
+     *
+     * If `bvn`, `bank_account_number`, and `bank_code` are provided, the
+     * identification step runs and Paystack validates against NIBSS. The
+     * DVA is issued regardless (Paystack returns 202 Accepted on the
+     * identification call and continues processing in the background).
      */
     static async provisionVirtualAccount(
         userId: string,
-        options?: { 
-            split_code?: string; 
+        options?: {
+            split_code?: string;
             subaccount?: string;
             preferred_bank?: string;
+            bvn?: string;
+            bank_account_number?: string;
+            bank_code?: string;
+            bank_name?: string;
+            email?: string;
+            firstName?: string;
+            lastName?: string;
         }
     ): Promise<IVirtualAccount> {
-        // Check if user already has an active virtual account
+        // Idempotency — if user already has an active DVA, return it
         const existing = await VirtualAccountModel.getByUserId(userId);
         if (existing && existing.status === 'active') {
             logger.debug(`User ${userId} already has an active virtual account: ${existing.account_number}`);
             return existing;
         }
 
-        // Get user details
+        // Load user + passenger profile
         const user = await UserModel.findById(userId);
         if (!user) {
             throw new Error('User not found');
         }
 
-        // Get passenger profile
         const passenger = await PassengerModel.getProfile(userId);
         if (!passenger) {
             throw new Error('Passenger profile not found');
         }
 
-        // Prepare metadata with split information
+        const firstName = options?.firstName || passenger.first_name;
+        const lastName = options?.lastName || passenger.last_name;
+        const email = options?.email || user.email || '';
+
+        // Build metadata — everything Paystack needs to build the customer
+        // and submit NIBSS identification.
         const metadata: Record<string, any> = {
-            userId: userId,
+            userId,
             userType: 'passenger',
             phoneNumber: user.phone_number,
-            email: user.email || '',
+            email,
             passengerId: passenger.id,
+            firstName,
+            lastName,
         };
 
-        // Add split configuration if provided
         if (options?.split_code) {
             metadata.split_code = options.split_code;
             logger.info(`Provisioning DVA with split_code: ${options.split_code} for user ${userId}`);
@@ -71,16 +89,30 @@ export class VirtualAccountService {
             metadata.preferred_bank = options.preferred_bank;
         }
 
-        // Create virtual account via licensed partner (Paystack)
+        // Phase 2A — BVN + bank details for NIBSS identification
+        if (options?.bvn) {
+            metadata.bvn = options.bvn;
+        }
+        if (options?.bank_account_number) {
+            metadata.bank_account_number = options.bank_account_number;
+        }
+        if (options?.bank_code) {
+            metadata.bank_code = options.bank_code;
+        }
+        if (options?.bank_name) {
+            metadata.bank_name = options.bank_name;
+        }
+
+        // Create customer + submit identification + issue DVA via licensed partner
         const partnerResponse = await LicensedPartnerService.createVirtualAccount({
-            accountName: `PingRide - ${passenger.first_name} ${passenger.last_name}`,
+            accountName: `PingRide - ${firstName} ${lastName}`,
             accountReference: `PR-${userId.substring(0, 8)}-${Date.now()}`,
-            metadata: metadata,
+            metadata,
         });
 
-        // Store virtual account in database
+        // Persist virtual account row
         const virtualAccount = await VirtualAccountModel.create({
-            userId: userId,
+            userId,
             provider: partnerResponse.provider,
             providerAccountId: partnerResponse.accountId,
             accountNumber: partnerResponse.accountNumber,
@@ -94,12 +126,25 @@ export class VirtualAccountService {
             },
         });
 
-        // Link virtual account to passenger profile
+        // Link to passenger profile
         await PassengerModel.linkVirtualAccount(userId, virtualAccount.id);
+
+        // Persist BVN on passenger profile. kyc_status stays 'pending' —
+        // Paystack validates NIBSS identification asynchronously and the
+        // DVA itself is the completion signal for Phase 2A.
+        if (options?.bvn) {
+            await pool.query(
+                `UPDATE passenger_profiles
+                 SET bvn = $1, kyc_status = 'pending', updated_at = NOW()
+                 WHERE user_id = $2`,
+                [options.bvn, userId]
+            );
+        }
 
         logger.info(`Virtual account provisioned for user ${userId}: ${virtualAccount.account_number}`, {
             bank: virtualAccount.bank_name,
             has_split: !!options?.split_code || !!options?.subaccount,
+            has_bvn: !!options?.bvn,
         });
 
         return virtualAccount;
@@ -108,15 +153,11 @@ export class VirtualAccountService {
     /**
      * Get a passenger's virtual account details
      * Automatically provisions if no account exists
-     * 
-     * @param userId - The user ID
-     * @param options - Optional configuration for provisioning
-     * @returns The virtual account or null
      */
     static async getVirtualAccount(
         userId: string,
-        options?: { 
-            split_code?: string; 
+        options?: {
+            split_code?: string;
             subaccount?: string;
             preferred_bank?: string;
         }
@@ -131,42 +172,19 @@ export class VirtualAccountService {
         return account;
     }
 
-    /**
-     * Get virtual account by account number
-     * 
-     * @param accountNumber - The virtual account number
-     * @returns The virtual account or null
-     */
     static async getVirtualAccountByNumber(accountNumber: string): Promise<IVirtualAccount | null> {
         return VirtualAccountModel.getByAccountNumber(accountNumber);
     }
 
-    /**
-     * Get all accounts for a user
-     * 
-     * @param userId - The user ID
-     * @returns Array of virtual accounts
-     */
     static async getUserAccounts(userId: string): Promise<IVirtualAccount[]> {
         return VirtualAccountModel.getAllByUserId(userId);
     }
 
-    /**
-     * Handle a bank transfer webhook
-     * Enhanced with split awareness for commission tracking
-     * 
-     * @param provider - The payment provider (e.g., 'paystack')
-     * @param payload - The webhook payload
-     * @param headers - The request headers
-     * @returns Processing result
-     */
     static async handleBankTransferWebhook(
         provider: string,
         payload: Record<string, any>,
         headers: Record<string, any>
     ): Promise<{ processed: boolean; message: string; eventId?: string }> {
-
-        // Verify webhook signature
         const isValid = await LicensedPartnerService.verifyWebhookSignature(
             provider,
             payload,
@@ -178,7 +196,6 @@ export class VirtualAccountService {
             return { processed: false, message: 'Invalid signature' };
         }
 
-        // Extract payload data with fallbacks
         const transactionId = payload.transaction_id || payload.reference || payload.id;
         const accountNumber = payload.account_number || payload.account || payload.accountNumber;
         const amount = payload.amount || 0;
@@ -188,36 +205,32 @@ export class VirtualAccountService {
         const narration = payload.narration || payload.description || '';
         const idempotencyKey = payload.idempotency_key || payload.idempotencyKey || transactionId;
 
-        // Validate required fields
         if (!transactionId || !accountNumber || amount <= 0) {
-            logger.warn('Invalid webhook payload - missing required fields', { 
-                transactionId, 
-                accountNumber, 
-                amount 
+            logger.warn('Invalid webhook payload - missing required fields', {
+                transactionId,
+                accountNumber,
+                amount
             });
             return { processed: false, message: 'Invalid payload - missing required fields' };
         }
 
-        // Check idempotency (prevent duplicate processing)
         const existingEvent = await BankTransferEventModel.getByIdempotencyKey(idempotencyKey);
         if (existingEvent) {
             logger.info(`Duplicate webhook ignored: ${idempotencyKey}`, {
                 eventId: existingEvent.id,
                 status: existingEvent.status,
             });
-            return { 
-                processed: true, 
-                message: 'Duplicate webhook - already processed', 
-                eventId: existingEvent.id 
+            return {
+                processed: true,
+                message: 'Duplicate webhook - already processed',
+                eventId: existingEvent.id
             };
         }
 
-        // Find virtual account
         const virtualAccount = await VirtualAccountModel.getByAccountNumber(accountNumber);
         if (!virtualAccount) {
             logger.warn(`Virtual account not found: ${accountNumber}`);
-            
-            // Log unmatched transfer for manual reconciliation
+
             await BankTransferEventModel.createUnmatched({
                 provider: provider,
                 providerTransactionId: transactionId,
@@ -229,13 +242,9 @@ export class VirtualAccountService {
             return { processed: false, message: 'Account not found' };
         }
 
-        // ============================================
-        // CHECK FOR SPLIT TRANSACTION
-        // ============================================
         let splitData: any = null;
         const payloadMetadata = payload.metadata || {};
-        
-        // Check if this is a split transaction (Paystack DVA split)
+
         if (payloadMetadata.split) {
             splitData = payloadMetadata.split;
             logger.info('Split transaction detected in webhook', {
@@ -245,7 +254,6 @@ export class VirtualAccountService {
             });
         }
 
-        // Check for subaccount split
         if (payload.subaccount) {
             splitData = {
                 ...splitData,
@@ -257,7 +265,6 @@ export class VirtualAccountService {
             });
         }
 
-        // Check if split is configured on the virtual account
         const vaMetadata = virtualAccount.metadata || {};
         if (vaMetadata.split_code || vaMetadata.subaccount) {
             splitData = {
@@ -272,7 +279,6 @@ export class VirtualAccountService {
             });
         }
 
-        // Create bank transfer event
         const event = await BankTransferEventModel.create({
             virtualAccountId: virtualAccount.id,
             userId: virtualAccount.user_id,
@@ -287,7 +293,6 @@ export class VirtualAccountService {
         });
 
         try {
-            // Credit the user's wallet
             const result = await WalletService.creditDepositedFunds(
                 virtualAccount.user_id,
                 event.amount,
@@ -298,7 +303,6 @@ export class VirtualAccountService {
                     event_id: event.id,
                     sender_name: event.sender_name,
                     sender_account: event.sender_account_number,
-                    // Include split information in transaction metadata
                     split: splitData,
                     webhook_payload: {
                         transaction_id: transactionId,
@@ -308,12 +312,8 @@ export class VirtualAccountService {
                 }
             );
 
-            // Mark the bank transfer event as credited
             await BankTransferEventModel.markCredited(event.id, result.transaction.id);
 
-            // ============================================
-            // RECORD SPLIT INFORMATION FOR RECONCILIATION
-            // ============================================
             if (splitData) {
                 await this.recordSplitTransaction(event.id, splitData, amount);
             }
@@ -337,40 +337,30 @@ export class VirtualAccountService {
                 transactionId: transactionId,
                 userId: virtualAccount.user_id,
             });
-            
+
             await BankTransferEventModel.markFailed(event.id, errorMessage);
-            return { 
-                processed: false, 
-                message: `Failed to credit: ${errorMessage}`, 
-                eventId: event.id 
+            return {
+                processed: false,
+                message: `Failed to credit: ${errorMessage}`,
+                eventId: event.id
             };
         }
     }
 
-    /**
-     * Record split transaction details for reconciliation
-     * 
-     * @param eventId - The bank transfer event ID
-     * @param splitData - The split configuration data
-     * @param totalAmount - The total transaction amount
-     */
     private static async recordSplitTransaction(
         eventId: string,
         splitData: any,
         totalAmount: number
     ): Promise<void> {
         try {
-            // Get the event to update with split information
             const event = await BankTransferEventModel.getById(eventId);
             if (!event) {
                 logger.warn(`Event ${eventId} not found for split recording`);
                 return;
             }
 
-            // Build metadata with existing metadata or empty object
             const existingMetadata = event.metadata || {};
 
-            // Update the event's metadata with split information
             const updatedMetadata = {
                 ...existingMetadata,
                 split: {
@@ -382,8 +372,6 @@ export class VirtualAccountService {
                 },
             };
 
-            // Direct update using pool query to avoid circular dependency
-            const pool = (await import('../config/database')).default;
             await pool.query(
                 `UPDATE bank_transfer_events 
                  SET metadata = $1, updated_at = NOW() 
@@ -391,7 +379,6 @@ export class VirtualAccountService {
                 [updatedMetadata, eventId]
             );
 
-            // Log split subaccount details
             if (splitData.subaccounts && splitData.subaccounts.length > 0) {
                 for (const subaccount of splitData.subaccounts) {
                     logger.info('Split subaccount details', {
@@ -408,18 +395,10 @@ export class VirtualAccountService {
                 subaccounts_count: splitData.subaccounts?.length || 0,
             });
         } catch (error) {
-            // Don't fail the main flow if split recording fails
             logger.error('Error recording split transaction:', error);
         }
     }
 
-    /**
-     * Update virtual account status
-     * 
-     * @param accountId - The virtual account ID
-     * @param status - The new status
-     * @returns The updated virtual account
-     */
     static async updateAccountStatus(
         accountId: string,
         status: 'pending' | 'active' | 'suspended' | 'closed'
@@ -427,34 +406,15 @@ export class VirtualAccountService {
         return VirtualAccountModel.updateStatus(accountId, status);
     }
 
-    /**
-     * Update KYC status
-     * 
-     * @param accountId - The virtual account ID
-     * @param verified - Whether KYC is verified
-     * @returns The updated virtual account
-     */
     static async updateKycStatus(accountId: string, verified: boolean): Promise<IVirtualAccount | null> {
         return VirtualAccountModel.updateKycStatus(accountId, verified);
     }
 
-    /**
-     * Get pending bank transfer events for a user
-     * 
-     * @param userId - The user ID
-     * @returns Array of pending bank transfer events
-     */
     static async getPendingTransfers(userId: string): Promise<IBankTransferEvent[]> {
         const result = await BankTransferEventModel.getByUserId(userId);
         return result.events.filter((event: IBankTransferEvent) => event.status === 'pending');
     }
 
-    /**
-     * Reconcile a pending transfer manually
-     * 
-     * @param eventId - The bank transfer event ID
-     * @returns The reconciled event or null
-     */
     static async reconcileTransfer(eventId: string): Promise<IBankTransferEvent | null> {
         const event = await BankTransferEventModel.getById(eventId);
         if (!event) {
@@ -478,31 +438,24 @@ export class VirtualAccountService {
                 }
             );
             await BankTransferEventModel.markCredited(event.id, result.transaction.id);
-            
+
             logger.info(`Transfer reconciled manually: ${eventId}`, {
                 userId: event.user_id,
                 amount: event.amount,
             });
-            
-            // Return updated event with metadata
+
             const updatedEvent = await BankTransferEventModel.getById(eventId);
             return updatedEvent;
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
             logger.error(`Failed to reconcile transfer: ${eventId}`, { error: errorMessage });
             await BankTransferEventModel.markFailed(event.id, errorMessage);
-            
+
             const updatedEvent = await BankTransferEventModel.getById(eventId);
             return updatedEvent;
         }
     }
 
-    /**
-     * Get virtual account with split configuration details
-     * 
-     * @param userId - The user ID
-     * @returns Virtual account with split details
-     */
     static async getVirtualAccountWithSplitDetails(userId: string): Promise<any> {
         const account = await VirtualAccountModel.getByUserId(userId);
         if (!account) {
@@ -520,13 +473,6 @@ export class VirtualAccountService {
         };
     }
 
-    /**
-     * Update split configuration on an existing virtual account
-     * 
-     * @param userId - The user ID
-     * @param splitConfig - The split configuration
-     * @returns The updated virtual account
-     */
     static async updateSplitConfiguration(
         userId: string,
         splitConfig: {
@@ -548,8 +494,6 @@ export class VirtualAccountService {
             split_updated_at: new Date().toISOString(),
         };
 
-        // Update the metadata directly
-        const pool = (await import('../config/database')).default;
         const result = await pool.query(
             `UPDATE virtual_accounts 
              SET metadata = $1, updated_at = NOW() 
@@ -570,12 +514,6 @@ export class VirtualAccountService {
         return result.rows[0];
     }
 
-    /**
-     * Check if a user has split configured on their virtual account
-     * 
-     * @param userId - The user ID
-     * @returns True if split is configured
-     */
     static async hasSplitConfigured(userId: string): Promise<boolean> {
         const account = await VirtualAccountModel.getByUserId(userId);
         if (!account) {
@@ -586,12 +524,6 @@ export class VirtualAccountService {
         return !!(metadata.split_code || metadata.subaccount);
     }
 
-    /**
-     * Get split configuration for a user
-     * 
-     * @param userId - The user ID
-     * @returns The split configuration or null
-     */
     static async getSplitConfiguration(userId: string): Promise<{
         split_code: string | null;
         subaccount: string | null;

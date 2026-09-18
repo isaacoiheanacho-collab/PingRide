@@ -10,8 +10,8 @@ import { PassengerModel } from '../models/passenger.model';
 import { DriverModel } from '../models/driver.model';
 import { PaystackService } from './paystack.service';
 import { WalletService } from './wallet.service';
-import { 
-  IPayment, 
+import {
+  IPayment,
   IInitializePaymentRequest,
   IInitializePaymentResponse,
   IVerifyPaymentRequest,
@@ -25,13 +25,10 @@ import {
   ISplitConfig,
   IPaystackWebhookEvent
 } from '../types/payment.types';
-import { env } from '../config/env';
 import logger from '../utils/logger';
 import pool from '../config/database';
 
 export class PaymentService {
-  private static readonly COMMISSION_RATE = env.commissionRate || 0.15; // 15%
-
   // ============================================
   // PAYMENT PROCESSING
   // ============================================
@@ -39,7 +36,6 @@ export class PaymentService {
   /**
    * Initialize a payment
    * ONLY supports wallet payments - NO CARD
-   * Card is NOT used anywhere in PingRide
    */
   static async initializePayment(
     data: IInitializePaymentRequest
@@ -80,28 +76,25 @@ export class PaymentService {
   static async verifyPayment(
     data: IVerifyPaymentRequest
   ): Promise<IPayment> {
-    // Verify with Paystack
     const paystackResponse = await PaystackService.verifyTransaction(data.reference);
 
     if (!paystackResponse.status) {
       throw new Error('Payment verification failed');
     }
 
-    // Get payment by reference
     const payment = await PaymentModel.getByGatewayReference(data.reference);
     if (!payment) {
       throw new Error('Payment not found');
     }
 
     const status = this.mapPaystackStatus(paystackResponse.data.status) as PaymentStatus;
-    
+
     const updatedPayment = await PaymentModel.update(payment.id, {
       status,
       gateway_response: paystackResponse.data,
       paid_at: paystackResponse.data.paid_at ? new Date(paystackResponse.data.paid_at) : undefined,
     });
 
-    // If payment is successful, process the payment
     if (status === 'paid') {
       await this.processSuccessfulPayment(updatedPayment!);
     }
@@ -125,14 +118,12 @@ export class PaymentService {
       throw new Error('Payment is not in processable state');
     }
 
-    // Capture payment
     const updatedPayment = await PaymentModel.update(payment.id, {
       status: 'paid',
       captured_at: new Date(),
       paid_at: new Date(),
     });
 
-    // Process successful payment
     await this.processSuccessfulPayment(updatedPayment!);
 
     logger.info(`Payment processed: ${payment.id}`);
@@ -141,12 +132,18 @@ export class PaymentService {
 
   /**
    * Process a successful payment
-   * Handles commission, driver earnings, wallet updates
+   *
+   * The ledger is informational only. Real money moves through
+   * the Paystack split (driver subaccount). We record a
+   * non-balance-affecting row so the driver's app can show
+   * their earnings history.
    */
   private static async processSuccessfulPayment(payment: IPayment): Promise<void> {
-    const commissionRate = payment.commission_rate || this.COMMISSION_RATE;
-    const commissionAmount = payment.amount * commissionRate;
-    const driverEarnings = payment.amount - commissionAmount;
+    const split = this.getSplitPercentages();
+
+    const commissionAmount = payment.amount * (split.pingrideSplit / 100);
+    const driverEarnings = payment.amount * (split.driverSplit / 100);
+    const commissionRate = split.pingrideSplit / 100;
 
     // Update payment with commission details
     await PaymentModel.update(payment.id, {
@@ -156,34 +153,39 @@ export class PaymentService {
       processed_at: new Date(),
     });
 
-    // Credit driver's ledger
+    // Record informational earning row (no balance change)
     if (payment.driver_id) {
-      const ledger = await DriverLedgerModel.createIfNotExists(payment.driver_id);
-      
-      // Add digital earnings
-      await DriverLedgerModel.addDigitalEarnings(payment.driver_id, driverEarnings);
-      
-      // Deduct commission
-      await DriverLedgerModel.deductCommission(payment.driver_id, commissionAmount);
+      try {
+        await DriverLedgerModel.recordEarningInformational(
+          payment.driver_id,
+          driverEarnings,
+          payment.id,
+          `Ride earning — payment ${payment.id}`,
+          {
+            payment_id: payment.id,
+            ride_id: payment.ride_id,
+            gross_amount: payment.amount,
+            commission_amount: commissionAmount,
+            rebate_amount: payment.amount * (split.rebateSplit / 100),
+            driver_share_pct: split.driverSplit,
+            source: 'processSuccessfulPayment',
+          }
+        );
 
-      // Create ledger transaction
-      await DriverLedgerModel.createTransaction({
-        driver_ledger_id: ledger.id,
-        transaction_type: 'earning',
-        amount: driverEarnings,
-        balance_before: ledger.net_balance,
-        balance_after: ledger.net_balance + driverEarnings,
-        reference_type: 'payment',
-        reference_id: payment.id,
-        description: `Ride payment: ${payment.ride_id || 'N/A'}`,
-      });
-
-      logger.info(`Driver earnings credited: ${payment.driver_id}, amount: ${driverEarnings}`);
+        logger.info(
+          `Driver earning recorded (informational): ${payment.driver_id}, amount: ${driverEarnings}`
+        );
+      } catch (error) {
+        // Informational ledger failure must not break payment processing.
+        logger.error(
+          `Failed to record informational earning for driver ${payment.driver_id}:`,
+          error
+        );
+      }
     }
 
     // Debit passenger's wallet if wallet payment
     if (payment.payment_method === 'wallet' && payment.passenger_id) {
-      // Get passenger user ID
       const passenger = await this.getPassengerUserId(payment.passenger_id);
       if (passenger) {
         await WalletService.processPayment(
@@ -207,26 +209,31 @@ export class PaymentService {
       throw new Error('Payment not found');
     }
 
-    // Get passenger user ID
     const passengerUserId = await this.getPassengerUserId(payment.passenger_id);
     if (!passengerUserId) {
       throw new Error('Passenger user not found');
     }
 
-    // Check wallet balance
+    // Check wallet balance (sum of the three columns)
     const wallet = await WalletModel.getByUserId(passengerUserId);
-    if (!wallet || wallet.balance < payment.amount) {
-      throw new Error('Insufficient wallet balance. Please fund your wallet via bank transfer to your virtual account.');
+    const totalBalance = wallet
+      ? (wallet.deposited_balance || 0) +
+        (wallet.rebate_credit_balance || 0) +
+        (wallet.promotional_balance || 0)
+      : 0;
+
+    if (!wallet || totalBalance < payment.amount) {
+      throw new Error(
+        'Insufficient wallet balance. Please fund your wallet via bank transfer to your virtual account.'
+      );
     }
 
-    // Debit wallet
-    const debitResult = await WalletService.debit(
+    // Debit wallet (uses the priority-aware payForRide flow)
+    const debitResult = await WalletService.payForRide(
       passengerUserId,
+      payment.ride_id || payment.id,
       payment.amount,
-      'Ride payment',
-      'payment',
-      paymentId,
-      { ride_id: payment.ride_id }
+      { ride_id: payment.ride_id, source: 'processWalletPayment' }
     );
 
     // Mark payment as paid
@@ -236,13 +243,14 @@ export class PaymentService {
       processed_at: new Date(),
     });
 
-    // Process successful payment
     await this.processSuccessfulPayment(updatedPayment!);
 
     logger.info(`Wallet payment processed: ${paymentId}`);
+
+    // Return the first transaction as the "primary" transaction
     return {
       payment: updatedPayment!,
-      transaction: debitResult.transaction,
+      transaction: debitResult.transactions[0],
     };
   }
 
@@ -252,12 +260,11 @@ export class PaymentService {
 
   /**
    * Initialize a split payment for a ride
-   * 
+   *
    * SPLIT BREAKDOWN:
-   * - Driver: 84% (paid directly to driver subaccount)
-   * - PingRide: 15% (commission)
-   * - Rebate: 1% (rebate fund)
-   * - Total: 100%
+   * - Driver: 84%
+   * - PingRide: 15%
+   * - Rebate: 1%
    */
   static async initializeSplitPayment(
     data: ISplitPaymentRequest
@@ -267,61 +274,52 @@ export class PaymentService {
     if (!driver) {
       throw new Error('Driver not found');
     }
-    
+
     // 2. Validate driver has subaccount
     if (!driver.subaccount_code || driver.subaccount_status !== 'active') {
       throw new Error('Driver does not have an active subaccount');
     }
-    
+
     // 3. Get subaccount codes from environment
     const pingrideSubaccount = process.env.PINGRIDE_SUBACCOUNT_CODE;
     const rebateSubaccount = process.env.REBATE_SUBACCOUNT_CODE;
-    
+
     if (!pingrideSubaccount || !rebateSubaccount) {
-      throw new Error('Subaccount configuration missing. Please set PINGRIDE_SUBACCOUNT_CODE and REBATE_SUBACCOUNT_CODE in environment.');
+      throw new Error(
+        'Subaccount configuration missing. Please set PINGRIDE_SUBACCOUNT_CODE and REBATE_SUBACCOUNT_CODE in environment.'
+      );
     }
-    
-    // 4. ✅ UPDATED: Get split percentages with new defaults
-    // Driver: 84%, PingRide: 15%, Rebate: 1%
-    const driverSplit = parseFloat(process.env.DRIVER_SPLIT_PERCENTAGE || '84.0');
-    const pingrideSplit = parseFloat(process.env.PINGRIDE_SPLIT_PERCENTAGE || '15.0');
-    const rebateSplit = parseFloat(process.env.REBATE_SPLIT_PERCENTAGE || '1.0');
-    
-    // Validate percentages sum to 100
-    const totalSplit = driverSplit + pingrideSplit + rebateSplit;
+
+    // 4. Get split percentages
+    const split = this.getSplitPercentages();
+
+    const totalSplit = split.driverSplit + split.pingrideSplit + split.rebateSplit;
     if (Math.abs(totalSplit - 100) > 0.01) {
-      logger.warn(`Split percentages do not sum to 100%. Current total: ${totalSplit}%`);
+      logger.warn(
+        `Split percentages do not sum to 100%. Current total: ${totalSplit}%`
+      );
     }
-    
+
     // 5. Create split configuration
     const splitConfig: ISplitConfig = {
       type: 'percentage',
       currency: 'NGN',
       subaccounts: [
-        {
-          subaccount: driver.subaccount_code,
-          share: driverSplit
-        },
-        {
-          subaccount: pingrideSubaccount,
-          share: pingrideSplit
-        },
-        {
-          subaccount: rebateSubaccount,
-          share: rebateSplit
-        }
+        { subaccount: driver.subaccount_code, share: split.driverSplit },
+        { subaccount: pingrideSubaccount, share: split.pingrideSplit },
+        { subaccount: rebateSubaccount, share: split.rebateSplit }
       ]
     };
-    
+
     logger.info(`Creating split payment for ride ${data.ride_id}`, {
       driver: data.driver_id,
       driverSubaccount: driver.subaccount_code,
-      driverShare: driverSplit,
-      pingrideShare: pingrideSplit,
-      rebateShare: rebateSplit,
+      driverShare: split.driverSplit,
+      pingrideShare: split.pingrideSplit,
+      rebateShare: split.rebateSplit,
       amount: data.amount,
     });
-    
+
     // 6. Create payment record
     const payment = await PaymentModel.create({
       ride_id: data.ride_id,
@@ -331,7 +329,7 @@ export class PaymentService {
       payment_method: 'wallet',
       payment_type: 'ride',
     });
-    
+
     // 7. Initialize Paystack transaction with split
     const reference = PaystackService.generateReference();
     const response = await PaystackService.initializeTransaction({
@@ -346,9 +344,9 @@ export class PaymentService {
         payment_id: payment.id,
         payment_type: 'split',
         split: {
-          driver_share: data.amount * (driverSplit / 100),
-          pingride_share: data.amount * (pingrideSplit / 100),
-          rebate_share: data.amount * (rebateSplit / 100),
+          driver_share: data.amount * (split.driverSplit / 100),
+          pingride_share: data.amount * (split.pingrideSplit / 100),
+          rebate_share: data.amount * (split.rebateSplit / 100),
           driver_subaccount: driver.subaccount_code,
           pingride_subaccount: pingrideSubaccount,
           rebate_subaccount: rebateSubaccount,
@@ -356,15 +354,15 @@ export class PaymentService {
         }
       }
     });
-    
+
     // 8. Update payment with gateway reference
     await PaymentModel.update(payment.id, {
       gateway_reference: reference,
       gateway_response: response.data,
     });
-    
+
     logger.info(`Split payment initialized: ${reference} for ride ${data.ride_id}`);
-    
+
     return {
       authorization_url: response.data.authorization_url,
       reference: reference,
@@ -375,60 +373,71 @@ export class PaymentService {
 
   /**
    * Handle split payment webhook
+   *
+   * Ledger is informational only. Paystack already split the money
+   * to the driver's subaccount. We record a non-balance-affecting
+   * earning row so the driver's app can show history.
    */
   static async handleSplitPaymentWebhook(
     reference: string,
     event: IPaystackWebhookEvent
   ): Promise<void> {
-    // Get payment
     const payment = await PaymentModel.getByGatewayReference(reference);
     if (!payment) {
       logger.error(`Payment not found for split webhook: ${reference}`);
       throw new Error('Payment not found');
     }
-    
+
     // Update payment status
     await PaymentModel.update(payment.id, {
       status: 'paid',
       paid_at: new Date(),
       gateway_response: event.data,
     });
-    
-    // Calculate commission and driver earnings
-    const commissionRate = env.commissionRate || 0.15; // 15%
+
+    // Calculate commission and driver earnings from the same split config
+    const split = this.getSplitPercentages();
+    const commissionRate = split.pingrideSplit / 100;
     const commissionAmount = payment.amount * commissionRate;
-    const driverEarnings = payment.amount - commissionAmount;
-    
+    const driverEarnings = payment.amount * (split.driverSplit / 100);
+
     await PaymentModel.update(payment.id, {
       commission_amount: commissionAmount,
       commission_rate: commissionRate,
       driver_earnings: driverEarnings,
       processed_at: new Date(),
     });
-    
-    // Credit driver's ledger
+
+    // Record informational earning row (no balance change)
     if (payment.driver_id) {
-      await DriverLedgerModel.addDigitalEarnings(
-        payment.driver_id,
-        driverEarnings
-      );
-      
-      // Create ledger transaction
-      const ledger = await DriverLedgerModel.createIfNotExists(payment.driver_id);
-      await DriverLedgerModel.createTransaction({
-        driver_ledger_id: ledger.id,
-        transaction_type: 'earning',
-        amount: driverEarnings,
-        balance_before: ledger.net_balance,
-        balance_after: ledger.net_balance + driverEarnings,
-        reference_type: 'payment',
-        reference_id: payment.id,
-        description: `Split ride payment: ${payment.ride_id || 'N/A'}`,
-      });
-      
-      logger.info(`Driver earnings credited via split webhook: ${payment.driver_id}, amount: ${driverEarnings}`);
+      try {
+        await DriverLedgerModel.recordEarningInformational(
+          payment.driver_id,
+          driverEarnings,
+          reference,
+          `Split ride earning — ref ${reference}`,
+          {
+            payment_id: payment.id,
+            ride_id: payment.ride_id,
+            gross_amount: payment.amount,
+            commission_amount: commissionAmount,
+            rebate_amount: payment.amount * (split.rebateSplit / 100),
+            driver_share_pct: split.driverSplit,
+            source: 'handleSplitPaymentWebhook',
+          }
+        );
+
+        logger.info(
+          `Driver earning recorded (informational, split): ${payment.driver_id}, amount: ${driverEarnings}`
+        );
+      } catch (error) {
+        logger.error(
+          `Failed to record informational earning for driver ${payment.driver_id} (split webhook):`,
+          error
+        );
+      }
     }
-    
+
     // Track qualification if ride_id exists
     if (payment.ride_id) {
       await this.trackRideForQualification(
@@ -438,9 +447,11 @@ export class PaymentService {
         payment.amount
       );
     } else {
-      logger.warn(`No ride_id found for payment ${payment.id}, skipping qualification tracking`);
+      logger.warn(
+        `No ride_id found for payment ${payment.id}, skipping qualification tracking`
+      );
     }
-    
+
     logger.info(`Split payment webhook processed: ${reference}`, {
       paymentId: payment.id,
       amount: payment.amount,
@@ -451,12 +462,6 @@ export class PaymentService {
 
   /**
    * Get split configuration for a ride payment
-   * 
-   * SPLIT BREAKDOWN:
-   * - Driver: 84% (paid directly to driver subaccount)
-   * - PingRide: 15% (commission)
-   * - Rebate: 1% (rebate fund)
-   * - Total: 100%
    */
   static async getSplitConfigForRide(driverId: string): Promise<{
     driverSplit: number;
@@ -466,34 +471,28 @@ export class PaymentService {
     pingrideSubaccount: string;
     rebateSubaccount: string;
   }> {
-    // Get driver details
     const driver = await DriverModel.getById(driverId);
     if (!driver) {
       throw new Error('Driver not found');
     }
-    
+
     if (!driver.subaccount_code || driver.subaccount_status !== 'active') {
       throw new Error('Driver does not have an active subaccount');
     }
-    
-    // Get subaccount codes from environment
+
     const pingrideSubaccount = process.env.PINGRIDE_SUBACCOUNT_CODE;
     const rebateSubaccount = process.env.REBATE_SUBACCOUNT_CODE;
-    
+
     if (!pingrideSubaccount || !rebateSubaccount) {
       throw new Error('Subaccount configuration missing');
     }
-    
-    // ✅ UPDATED: Get split percentages with new defaults
-    // Driver: 84%, PingRide: 15%, Rebate: 1%
-    const driverSplit = parseFloat(process.env.DRIVER_SPLIT_PERCENTAGE || '84.0');
-    const pingrideSplit = parseFloat(process.env.PINGRIDE_SPLIT_PERCENTAGE || '15.0');
-    const rebateSplit = parseFloat(process.env.REBATE_SPLIT_PERCENTAGE || '1.0');
-    
+
+    const split = this.getSplitPercentages();
+
     return {
-      driverSplit,
-      pingrideSplit,
-      rebateSplit,
+      driverSplit: split.driverSplit,
+      pingrideSplit: split.pingrideSplit,
+      rebateSplit: split.rebateSplit,
       driverSubaccount: driver.subaccount_code,
       pingrideSubaccount: pingrideSubaccount,
       rebateSubaccount: rebateSubaccount,
@@ -519,7 +518,6 @@ export class PaymentService {
       throw new Error('Only paid payments can be refunded');
     }
 
-    // Create refund record
     const refund = await PaymentModel.createRefund({
       transaction_id: payment.id,
       ride_id: payment.ride_id || '',
@@ -529,17 +527,18 @@ export class PaymentService {
       initiated_by: payment.passenger_id,
     });
 
-    // Process refund based on payment method
     if (payment.gateway_reference) {
-      // Paystack refund
       const paystackRefund = await PaystackService.createRefund(
         payment.gateway_reference,
         PaystackService.toKobo(data.amount)
       );
 
-      await PaymentModel.updateRefundStatus(refund.id, 'processed', paystackRefund.data.reference);
+      await PaymentModel.updateRefundStatus(
+        refund.id,
+        'processed',
+        paystackRefund.data.reference
+      );
     } else {
-      // Wallet refund
       const passengerUserId = await this.getPassengerUserId(payment.passenger_id);
       if (passengerUserId) {
         await WalletService.refund(
@@ -553,7 +552,6 @@ export class PaymentService {
       await PaymentModel.updateRefundStatus(refund.id, 'processed');
     }
 
-    // Update payment status
     await PaymentModel.update(payment.id, {
       status: 'refunded'
     });
@@ -566,23 +564,14 @@ export class PaymentService {
   // PAYMENT LOOKUP
   // ============================================
 
-  /**
-   * Get payment by ID
-   */
   static async getPaymentById(id: string): Promise<IPayment | null> {
     return PaymentModel.getById(id);
   }
 
-  /**
-   * Get payment with details
-   */
   static async getPaymentWithDetails(id: string): Promise<any> {
     return PaymentModel.getWithDetails(id);
   }
 
-  /**
-   * Get payments by passenger
-   */
   static async getPaymentsByPassenger(
     passengerId: string,
     page: number = 1,
@@ -591,9 +580,6 @@ export class PaymentService {
     return PaymentModel.getByPassengerId(passengerId, page, limit);
   }
 
-  /**
-   * Get payments by driver
-   */
   static async getPaymentsByDriver(
     driverId: string,
     page: number = 1,
@@ -602,9 +588,6 @@ export class PaymentService {
     return PaymentModel.getByDriverId(driverId, page, limit);
   }
 
-  /**
-   * Get all payments
-   */
   static async getAllPayments(
     page: number = 1,
     limit: number = 100,
@@ -623,9 +606,6 @@ export class PaymentService {
   // PAYMENT SUMMARY
   // ============================================
 
-  /**
-   * Get payment summary
-   */
   static async getPaymentSummary(): Promise<{
     totalRevenue: number;
     totalCommission: number;
@@ -690,10 +670,11 @@ export class PaymentService {
       processed_at: new Date(),
     });
 
-    // Step 4: Calculate and record allocation
-    const commissionRate = env.commissionRate || 0.15; // 15%
+    // Step 4: Calculate and record allocation from split config
+    const split = this.getSplitPercentages();
+    const commissionRate = split.pingrideSplit / 100;
     const commissionAmount = amount * commissionRate;
-    const driverEarnings = amount - commissionAmount;
+    const driverEarnings = amount * (split.driverSplit / 100);
 
     await PaymentModel.update(payment.id, {
       commission_amount: commissionAmount,
@@ -701,41 +682,45 @@ export class PaymentService {
       driver_earnings: driverEarnings,
     });
 
-    // Step 5: Credit driver's ledger using DriverLedgerModel directly
+    // Step 5: Record informational earning row (no balance change)
     if (rideDetails?.driverId) {
       try {
-        // Create ledger if not exists
-        const ledger = await DriverLedgerModel.createIfNotExists(rideDetails.driverId);
-        
-        // Add digital earnings
-        await DriverLedgerModel.addDigitalEarnings(rideDetails.driverId, driverEarnings);
-        
-        // Deduct commission
-        await DriverLedgerModel.deductCommission(rideDetails.driverId, commissionAmount);
+        await DriverLedgerModel.recordEarningInformational(
+          rideDetails.driverId,
+          driverEarnings,
+          payment.id,
+          `Ride earning — ride ${rideId}`,
+          {
+            payment_id: payment.id,
+            ride_id: rideId,
+            gross_amount: amount,
+            commission_amount: commissionAmount,
+            rebate_amount: amount * (split.rebateSplit / 100),
+            driver_share_pct: split.driverSplit,
+            source: 'processRidePaymentWithWallet',
+          }
+        );
 
-        // Create ledger transaction
-        await DriverLedgerModel.createTransaction({
-          driver_ledger_id: ledger.id,
-          transaction_type: 'earning',
-          amount: driverEarnings,
-          balance_before: ledger.net_balance,
-          balance_after: ledger.net_balance + driverEarnings,
-          reference_type: 'payment',
-          reference_id: payment.id,
-          description: `Ride payment - ${rideId}`,
-        });
-
-        logger.info(`Driver earnings credited: ${rideDetails.driverId}, amount: ${driverEarnings}`);
+        logger.info(
+          `Driver earning recorded (informational): ${rideDetails.driverId}, amount: ${driverEarnings}`
+        );
       } catch (error) {
-        logger.error(`Failed to credit driver earnings for ${rideDetails.driverId}:`, error);
+        logger.error(
+          `Failed to record informational earning for ${rideDetails.driverId}:`,
+          error
+        );
         // Don't fail the payment if ledger update fails
       }
     }
 
     // Step 6: Trigger qualification tracking
-    await this.trackRideForQualification(rideId, passengerUserId, rideDetails?.driverId, amount);
+    await this.trackRideForQualification(
+      rideId,
+      passengerUserId,
+      rideDetails?.driverId,
+      amount
+    );
 
-    // Get the updated payment
     const updatedPayment = await PaymentModel.getById(payment.id);
 
     return {
@@ -749,6 +734,22 @@ export class PaymentService {
   // ============================================
   // HELPER METHODS
   // ============================================
+
+  /**
+   * Read split percentages from environment (single source of truth).
+   * Driver 84% / PingRide 15% / Rebate 1%.
+   */
+  private static getSplitPercentages(): {
+    driverSplit: number;
+    pingrideSplit: number;
+    rebateSplit: number;
+  } {
+    const driverSplit = parseFloat(process.env.DRIVER_SPLIT_PERCENTAGE || '84.0');
+    const pingrideSplit = parseFloat(process.env.PINGRIDE_SPLIT_PERCENTAGE || '15.0');
+    const rebateSplit = parseFloat(process.env.REBATE_SPLIT_PERCENTAGE || '1.0');
+
+    return { driverSplit, pingrideSplit, rebateSplit };
+  }
 
   /**
    * Map Paystack status to internal status
@@ -806,7 +807,9 @@ export class PaymentService {
       totalPayments: parseInt(row?.total_payments || '0', 10),
       totalSpent: parseFloat(row?.total_spent || '0'),
       totalRefunded: parseInt(row?.total_refunded || '0', 10),
-      lastPaymentDate: row?.last_payment_date ? new Date(row.last_payment_date) : null,
+      lastPaymentDate: row?.last_payment_date
+        ? new Date(row.last_payment_date)
+        : null,
     };
   }
 
@@ -837,7 +840,9 @@ export class PaymentService {
       totalPayments: parseInt(row?.total_payments || '0', 10),
       totalEarnings: parseFloat(row?.total_earnings || '0'),
       totalCommission: parseFloat(row?.total_commission || '0'),
-      lastPaymentDate: row?.last_payment_date ? new Date(row.last_payment_date) : null,
+      lastPaymentDate: row?.last_payment_date
+        ? new Date(row.last_payment_date)
+        : null,
     };
   }
 
@@ -851,22 +856,23 @@ export class PaymentService {
     amount: number
   ): Promise<void> {
     try {
-      // Get passenger profile ID
       const passenger = await PassengerModel.getProfile(passengerUserId);
       if (!passenger) {
-        logger.warn(`Passenger profile not found for user ${passengerUserId}, skipping qualification tracking`);
+        logger.warn(
+          `Passenger profile not found for user ${passengerUserId}, skipping qualification tracking`
+        );
         return;
       }
 
-      // Get current programme period
       const { ProgrammePeriodModel } = await import('../models/programme-period.model');
       const period = await ProgrammePeriodModel.getCurrent();
       if (!period) {
-        logger.warn('No active programme period found, skipping qualification tracking');
+        logger.warn(
+          'No active programme period found, skipping qualification tracking'
+        );
         return;
       }
 
-      // Track passenger spend
       const { QualificationService } = await import('./qualification.service');
       await QualificationService.trackPassengerSpend(
         passenger.id,
@@ -874,10 +880,9 @@ export class PaymentService {
         amount
       );
 
-      // Track driver contribution - only if driverId exists
       if (driverId) {
-        const commissionRate = env.commissionRate || 0.15;
-        const driverEarnings = amount * (1 - commissionRate);
+        const split = this.getSplitPercentages();
+        const driverEarnings = amount * (split.driverSplit / 100);
         await QualificationService.trackDriverContribution(
           driverId,
           rideId,
@@ -885,14 +890,13 @@ export class PaymentService {
         );
       }
 
-      // Record rebate contribution
       const { RebateFundService } = await import('./rebate-fund.service');
       await RebateFundService.recordContribution(
         rideId,
         passenger.id,
         amount
       );
-      
+
       logger.debug(`Qualification tracked for ride ${rideId}`);
     } catch (error) {
       logger.error('Error tracking ride qualification:', error);

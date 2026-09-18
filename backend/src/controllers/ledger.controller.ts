@@ -7,7 +7,6 @@ import { AuthRequest } from '../middleware/auth.middleware';
 import { ApiResponseHandler } from '../utils/response';
 import { DriverLedgerModel } from '../models/driver-ledger.model';
 import { DriverModel } from '../models/driver.model';
-import { SettlementService } from '../services/settlement.service';
 
 export class LedgerController {
   // ============================================
@@ -158,125 +157,6 @@ export class LedgerController {
     });
   }
 
-  /**
-   * Get driver total withdrawals (READ-ONLY)
-   * GET /api/v1/ledger/driver/withdrawals-total
-   */
-  async getDriverWithdrawalsTotal(req: AuthRequest, res: Response): Promise<Response> {
-    const userId = req.user?.id;
-    if (!userId) {
-      return ApiResponseHandler.unauthorized(res, 'Not authenticated');
-    }
-
-    const driver = await this.getDriverProfileByUserId(userId);
-    if (!driver) {
-      return ApiResponseHandler.validationError(res, 'Driver profile not found');
-    }
-
-    const withdrawals = await DriverLedgerModel.getTotalWithdrawals(driver.id);
-    return ApiResponseHandler.success(res, {
-      total_withdrawals: withdrawals,
-      _note: 'Historical data. Current payments are automatic via Paystack subaccount.',
-    });
-  }
-
-  // ============================================
-  // SETTLEMENT ROUTES (READ-ONLY)
-  // ============================================
-
-  /**
-   * Get driver settlements (READ-ONLY)
-   * GET /api/v1/ledger/settlements
-   * @deprecated Settlements are now automatic via Paystack subaccount.
-   * This endpoint shows historical settlement data only.
-   */
-  async getDriverSettlements(req: AuthRequest, res: Response): Promise<Response> {
-    const userId = req.user?.id;
-    if (!userId) {
-      return ApiResponseHandler.unauthorized(res, 'Not authenticated');
-    }
-
-    const driver = await this.getDriverProfileByUserId(userId);
-    if (!driver) {
-      return ApiResponseHandler.validationError(res, 'Driver profile not found');
-    }
-
-    const page = parseInt(req.query.page as string, 10) || 1;
-    const limit = parseInt(req.query.limit as string, 10) || 100;
-
-    const result = await SettlementService.getSettlementsByDriver(driver.id, page, limit);
-
-    return ApiResponseHandler.success(res, {
-      settlements: result.settlements,
-      total: result.total,
-      _note: 'Historical settlements. Current payments are automatic via Paystack subaccount.',
-      meta: {
-        timestamp: new Date().toISOString(),
-        pagination: {
-          page,
-          limit,
-          total: result.total,
-          pages: Math.ceil(result.total / limit),
-        }
-      }
-    });
-  }
-
-  /**
-   * Get driver settlement summary (READ-ONLY)
-   * GET /api/v1/ledger/settlements/summary
-   */
-  async getDriverSettlementSummary(req: AuthRequest, res: Response): Promise<Response> {
-    const userId = req.user?.id;
-    if (!userId) {
-      return ApiResponseHandler.unauthorized(res, 'Not authenticated');
-    }
-
-    const driver = await this.getDriverProfileByUserId(userId);
-    if (!driver) {
-      return ApiResponseHandler.validationError(res, 'Driver profile not found');
-    }
-
-    const summary = await SettlementService.getDriverSettlementSummary(driver.id);
-    return ApiResponseHandler.success(res, {
-      ...summary,
-      _note: 'Historical settlements. Current payments are automatic via Paystack subaccount.',
-    });
-  }
-
-  /**
-   * Get settlement by ID (READ-ONLY)
-   * GET /api/v1/ledger/settlements/:settlementId
-   */
-  async getSettlementById(req: AuthRequest, res: Response): Promise<Response> {
-    const userId = req.user?.id;
-    if (!userId) {
-      return ApiResponseHandler.unauthorized(res, 'Not authenticated');
-    }
-
-    const { settlementId } = req.params;
-    const settlementIdStr = Array.isArray(settlementId) ? settlementId[0] : settlementId;
-
-    const settlement = await SettlementService.getSettlementById(settlementIdStr);
-    if (!settlement) {
-      return ApiResponseHandler.notFound(res, 'Settlement not found');
-    }
-
-    // Verify ownership
-    const driver = await this.getDriverProfileByUserId(userId);
-    if (!driver || settlement.driver_id !== driver.id) {
-      const isAdmin = await this.isAdmin(userId);
-      if (!isAdmin) {
-        return ApiResponseHandler.forbidden(res, 'You do not have access to this settlement');
-      }
-    }
-
-    return ApiResponseHandler.success(res, {
-      ...settlement,
-      _note: 'Historical settlement. Current payments are automatic via Paystack subaccount.',
-    });
-  }
-
   // ============================================
   // ADMIN LEDGER ROUTES (READ-ONLY)
   // ============================================
@@ -314,65 +194,6 @@ export class LedgerController {
           pages: Math.ceil(result.total / limit),
         }
       }
-    });
-  }
-
-  /**
-   * Get all settlements (Admin - READ-ONLY)
-   * GET /api/v1/ledger/admin/settlements
-   */
-  async getAllSettlements(req: AuthRequest, res: Response): Promise<Response> {
-    const userId = req.user?.id;
-    if (!userId) {
-      return ApiResponseHandler.unauthorized(res, 'Not authenticated');
-    }
-
-    const isAdmin = await this.isAdmin(userId);
-    if (!isAdmin) {
-      return ApiResponseHandler.forbidden(res, 'Admin access required');
-    }
-
-    const page = parseInt(req.query.page as string, 10) || 1;
-    const limit = parseInt(req.query.limit as string, 10) || 100;
-    const status = req.query.status as string | undefined;
-
-    const result = await SettlementService.getAllSettlementsWithDetails(page, limit, status);
-
-    return ApiResponseHandler.success(res, {
-      settlements: result.settlements,
-      total: result.total,
-      _note: 'Historical settlements. Current payments are automatic via Paystack subaccount.',
-      meta: {
-        timestamp: new Date().toISOString(),
-        pagination: {
-          page,
-          limit,
-          total: result.total,
-          pages: Math.ceil(result.total / limit),
-        }
-      }
-    });
-  }
-
-  /**
-   * Get global settlement summary (Admin - READ-ONLY)
-   * GET /api/v1/ledger/admin/settlements/summary
-   */
-  async getGlobalSettlementSummary(req: AuthRequest, res: Response): Promise<Response> {
-    const userId = req.user?.id;
-    if (!userId) {
-      return ApiResponseHandler.unauthorized(res, 'Not authenticated');
-    }
-
-    const isAdmin = await this.isAdmin(userId);
-    if (!isAdmin) {
-      return ApiResponseHandler.forbidden(res, 'Admin access required');
-    }
-
-    const summary = await SettlementService.getGlobalSettlementSummary();
-    return ApiResponseHandler.success(res, {
-      ...summary,
-      _note: 'Historical data. Current payments are automatic via Paystack subaccount.',
     });
   }
 

@@ -21,7 +21,7 @@ export class RideService {
       const result = await pool.query(
         "SELECT value FROM platform_configuration WHERE key = 'bidding_window_seconds'"
       );
-      
+
       if (result.rows.length > 0) {
         const config = result.rows[0].value;
         const parsedConfig = typeof config === 'string' ? JSON.parse(config) : config;
@@ -185,7 +185,7 @@ export class RideService {
     if (!bid) {
       throw new NotFoundError('Bid not found');
     }
-    // FIXED: Use ride_id instead of ride_request_id
+    // Use ride_id (DB column) rather than ride_request_id
     if (bid.ride_id !== rideRequestId) {
       throw new ValidationError('Bid does not belong to this ride request');
     }
@@ -229,8 +229,15 @@ export class RideService {
 
   /**
    * Update ride status (driver side)
-   * FIXED: Uses correct status names that match database CHECK constraint
-   * V2.0: Triggers qualification and rebate tracking on ride completion
+   *
+   * On 'ride_completed', updates driver stats, passenger ride count, and
+   * passenger lifetime spend.
+   *
+   * Qualification + rebate tracking is NOT done here. It is deferred to
+   * PaymentService.trackRideForQualification(), which fires when the ride
+   * payment succeeds (via split payment or wallet). This prevents
+   * double-counting the same ride into passenger/driver qualification
+   * registries and the rebate fund.
    */
   static async updateRideStatus(
     driverId: string,
@@ -246,7 +253,7 @@ export class RideService {
       throw new ValidationError('You do not own this ride');
     }
 
-    // Validate status transition - FIXED to match database CHECK constraint
+    // Validate status transition to match database CHECK constraint
     const validTransitions: Record<string, string[]> = {
       'confirmed': ['driver_en_route', 'cancelled'],
       'driver_en_route': ['driver_arrived', 'cancelled'],
@@ -271,96 +278,37 @@ export class RideService {
     const updatedRide = await RideModel.updateStatus(rideId, statusData.status);
 
     // ============================================
-    // V2.0 INCENTIVE ECOSYSTEM INTEGRATION
+    // RIDE COMPLETION — STATS ONLY
     // ============================================
-    
-    // If ride is completed, trigger qualification and rebate tracking
     if (statusData.status === 'ride_completed') {
-      // 1. Update driver earnings (existing code)
+      // Update driver earnings aggregate
       await DriverModel.incrementRideStats(driverId, ride.bid_amount || 0);
-      
-      // 2. Update passenger ride count (existing code)
-      await PassengerModel.incrementRideCount(ride.passenger_id);
-      
-      // 3. Update passenger lifetime spend (existing code)
-      await PassengerModel.updateLifetimeSpend(ride.passenger_id, ride.bid_amount || 0);
 
-      // ===== NEW V2.0 FEATURES =====
+      // ride.passenger_id is a passenger_profiles.id.
+      // PassengerModel.incrementRideCount / updateLifetimeSpend filter on
+      // users.id, so we resolve the profile row first to get its user_id.
+      const passengerRow = await pool.query(
+        'SELECT user_id FROM passenger_profiles WHERE id = $1',
+        [ride.passenger_id]
+      );
 
-      // 4. Track passenger qualification (V2.0)
-      try {
-        const { QualificationService } = await import('./qualification.service');
-        await QualificationService.trackPassengerSpend(
-          ride.passenger_id,
-          rideId,
-          ride.bid_amount || 0
+      if (passengerRow.rows.length === 0) {
+        logger.error(
+          `Ride ${rideId} completed but passenger profile ${ride.passenger_id} not found — passenger stats not updated`
         );
-        logger.info(`Qualification tracked for passenger ${ride.passenger_id} on ride ${rideId}`);
-      } catch (error) {
-        // Don't block the ride completion if qualification tracking fails
-        logger.error('Error tracking passenger qualification:', error);
+      } else {
+        const passengerUserId = passengerRow.rows[0].user_id;
+        await PassengerModel.incrementRideCount(passengerUserId);
+        await PassengerModel.updateLifetimeSpend(passengerUserId, ride.bid_amount || 0);
       }
 
-      // 5. Track driver contribution (V2.0)
-      try {
-        const { QualificationService } = await import('./qualification.service');
-        const driverEarnings = ride.bid_amount || 0;
-        await QualificationService.trackDriverContribution(
-          ride.driver_id,
-          rideId,
-          driverEarnings
-        );
-        logger.info(`Driver contribution tracked for driver ${ride.driver_id} on ride ${rideId}`);
-      } catch (error) {
-        // Don't block the ride completion if driver contribution tracking fails
-        logger.error('Error tracking driver contribution:', error);
-      }
-
-      // 6. Record rebate fund contribution (V2.0)
-      try {
-        const { RebateFundService } = await import('./rebate-fund.service');
-        await RebateFundService.recordContribution(
-          rideId,
-          ride.passenger_id,
-          ride.bid_amount || 0
-        );
-        logger.info(`Rebate contribution recorded for ride ${rideId}`);
-      } catch (error) {
-        // Don't block the ride completion if rebate recording fails
-        logger.error('Error recording rebate contribution:', error);
-      }
-
-      // 7. Update ride with programme period (V2.0)
-      try {
-        const { ProgrammePeriodModel } = await import('../models/programme-period.model');
-        const period = await ProgrammePeriodModel.getCurrent();
-        if (period) {
-          await pool.query(
-            `UPDATE rides 
-             SET programme_period_id = $1, 
-                 ride_eligible_for_qualification = true,
-                 updated_at = NOW()
-             WHERE id = $2`,
-            [period.id, rideId]
-          );
-          logger.info(`Ride ${rideId} associated with programme period ${period.id}`);
-        }
-      } catch (error) {
-        logger.error('Error updating ride with programme period:', error);
-      }
-
-      // 8. Mark ride as eligible for qualification (default is true)
-      // Already set by the update above, but ensure it's correct
-      await pool.query(
-        `UPDATE rides 
-         SET ride_eligible_for_qualification = true
-         WHERE id = $1 AND ride_eligible_for_qualification IS NULL`,
-        [rideId]
+      // Qualification, rebate contribution, and programme-period association
+      // are handled by PaymentService when the ride payment succeeds. Do not
+      // duplicate them here.
+      logger.debug(
+        `Ride ${rideId} completed — qualification and rebate tracking deferred to PaymentService`
       );
     }
-
-    // ============================================
-    // END V2.0 INCENTIVE ECOSYSTEM INTEGRATION
     // ============================================
 
     logger.info(`Ride status updated: ${rideId} -> ${statusData.status}`);
@@ -436,7 +384,7 @@ export class RideService {
       throw new ValidationError('You do not own this ride');
     }
 
-    // Check if ride can be cancelled - FIXED to match database statuses
+    // Check if ride can be cancelled
     const cancellableStatuses = ['confirmed', 'driver_en_route', 'driver_arrived', 'ride_started', 'ride_in_progress'];
     if (!cancellableStatuses.includes(ride.status)) {
       throw new ValidationError(`Ride cannot be cancelled in ${ride.status} state`);
@@ -444,14 +392,14 @@ export class RideService {
 
     // Update ride status
     const updatedRide = await RideModel.updateStatus(rideId, 'cancelled');
-    
+
     // Update ride request status
     await RideRequestModel.updateStatus(ride.ride_request_id, 'cancelled', {
       cancelled_by: userType,
       cancellation_reason: reason || 'Cancelled by ' + userType,
     });
 
-    // V2.0: Mark ride as NOT eligible for qualification on cancellation
+    // Mark ride as NOT eligible for qualification on cancellation
     if (ride.programme_period_id) {
       await pool.query(
         `UPDATE rides 
@@ -472,16 +420,11 @@ export class RideService {
   }
 
   // ============================================
-  // SPLIT PAYMENT METHODS (NEW - Task 4)
+  // SPLIT PAYMENT METHODS
   // ============================================
 
   /**
    * Complete a ride and initiate split payment
-   * Called after ride is completed
-   * 
-   * @param rideId - The ID of the ride to complete
-   * @param passengerUserId - The user ID of the passenger
-   * @returns Ride details and payment initialization response
    */
   static async completeRideWithPayment(
     rideId: string,
@@ -495,39 +438,39 @@ export class RideService {
     if (!ride) {
       throw new NotFoundError('Ride not found');
     }
-    
+
     // 2. Verify ride is in completed state
     if (ride.status !== 'ride_completed') {
       throw new ValidationError('Ride must be completed before payment');
     }
-    
+
     // 3. Check if payment already exists
     const existingPayment = await PaymentModel.getByRideId(rideId);
     if (existingPayment && existingPayment.status === 'paid') {
       throw new ConflictError('Ride already paid');
     }
-    
+
     // 4. Get passenger email
     const passenger = await PassengerModel.getProfile(passengerUserId);
     if (!passenger) {
       throw new NotFoundError('Passenger profile not found');
     }
-    
+
     const user = await UserModel.findById(passengerUserId);
     if (!user?.email) {
       throw new ValidationError('Passenger email required for payment');
     }
-    
+
     // 5. Get driver details to verify subaccount
     const driver = await DriverModel.getById(ride.driver_id);
     if (!driver) {
       throw new NotFoundError('Driver not found');
     }
-    
+
     if (!driver.subaccount_code || driver.subaccount_status !== 'active') {
       throw new ValidationError('Driver does not have an active subaccount. Please contact support.');
     }
-    
+
     // 6. Initialize split payment
     const paymentResult = await PaymentService.initializeSplitPayment({
       ride_id: rideId,
@@ -536,7 +479,7 @@ export class RideService {
       amount: ride.bid_amount || 0,
       passenger_email: user.email,
     });
-    
+
     logger.info(`Split payment initiated for ride ${rideId}`, {
       rideId,
       passengerId: ride.passenger_id,
@@ -544,7 +487,7 @@ export class RideService {
       amount: ride.bid_amount,
       reference: paymentResult.reference,
     });
-    
+
     return {
       ride,
       payment: paymentResult,
@@ -553,11 +496,6 @@ export class RideService {
 
   /**
    * Check if a ride is ready for payment
-   * Validates ride status and driver subaccount
-   * 
-   * @param rideId - The ID of the ride to check
-   * @param passengerUserId - The user ID of the passenger
-   * @returns Validation result with details
    */
   static async canPayForRide(
     rideId: string,
@@ -575,53 +513,53 @@ export class RideService {
       if (!ride) {
         return { canPay: false, message: 'Ride not found' };
       }
-      
+
       // 2. Verify passenger owns the ride
       const passenger = await PassengerModel.getProfile(passengerUserId);
       if (!passenger || ride.passenger_id !== passenger.id) {
         return { canPay: false, message: 'You do not own this ride' };
       }
-      
+
       // 3. Verify ride is completed
       if (ride.status !== 'ride_completed') {
-        return { 
-          canPay: false, 
+        return {
+          canPay: false,
           message: `Ride must be completed before payment. Current status: ${ride.status}`,
           ride,
         };
       }
-      
+
       // 4. Check if payment already exists
       const existingPayment = await PaymentModel.getByRideId(rideId);
       if (existingPayment && existingPayment.status === 'paid') {
-        return { 
-          canPay: false, 
+        return {
+          canPay: false,
           message: 'Ride already paid',
           ride,
           paymentExists: true,
         };
       }
-      
+
       // 5. Check driver subaccount
       const driver = await DriverModel.getById(ride.driver_id);
       if (!driver) {
-        return { 
-          canPay: false, 
+        return {
+          canPay: false,
           message: 'Driver not found',
           ride,
         };
       }
-      
+
       const driverHasSubaccount = !!(driver.subaccount_code && driver.subaccount_status === 'active');
       if (!driverHasSubaccount) {
-        return { 
-          canPay: false, 
+        return {
+          canPay: false,
           message: 'Driver does not have an active subaccount. Please contact support.',
           ride,
           driverHasSubaccount: false,
         };
       }
-      
+
       return {
         canPay: true,
         ride,
@@ -637,9 +575,6 @@ export class RideService {
 
   /**
    * Get payment status for a ride
-   * 
-   * @param rideId - The ID of the ride
-   * @returns Payment status and details
    */
   static async getRidePaymentStatus(rideId: string): Promise<{
     hasPayment: boolean;
@@ -650,11 +585,11 @@ export class RideService {
     reference?: string;
   }> {
     const payment = await PaymentModel.getByRideId(rideId);
-    
+
     if (!payment) {
       return { hasPayment: false };
     }
-    
+
     return {
       hasPayment: true,
       paymentStatus: payment.status,

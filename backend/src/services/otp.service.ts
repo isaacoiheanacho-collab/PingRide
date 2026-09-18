@@ -1,3 +1,4 @@
+import { env } from '../config/env';
 import logger from '../utils/logger';
 import { generateOTP, storeOTP, verifyOTP, resendOTP, clearOTP } from '../utils/otp';
 
@@ -12,17 +13,24 @@ export class OTPService {
     try {
       // Generate OTP
       const otp = generateOTP();
-      
+
       // Store OTP in Redis
       await storeOTP(phoneNumber, otp, purpose);
-      
+
       // TODO: Integrate with SMS service
-      // For now, log the OTP for testing
-      logger.info(`📱 OTP for ${phoneNumber} (${purpose}): ${otp}`);
-      
+      // In development, log the OTP so it can be read from the console.
+      // In production, the SMS service must deliver it. Never log the OTP
+      // value in production — logs are shipped to third-party services and
+      // are not an authorised channel for one-time secrets.
+      if (env.nodeEnv !== 'production') {
+        logger.debug(`📱 OTP for ${phoneNumber} (${purpose}): ${otp}`);
+      } else {
+        logger.info(`📱 OTP dispatched for ${phoneNumber} (${purpose})`);
+      }
+
       // In production, send SMS here
       // await SMSService.sendOTP(phoneNumber, otp);
-      
+
       return {
         success: true,
         message: 'OTP sent successfully',
@@ -65,10 +73,14 @@ export class OTPService {
   ): Promise<{ success: boolean; message: string; otp?: string }> {
     try {
       const otp = await resendOTP(phoneNumber, purpose);
-      
-      // TODO: Integrate with SMS service
-      logger.info(`📱 Resent OTP for ${phoneNumber} (${purpose}): ${otp}`);
-      
+
+      // Same rule as sendOTP: never log the OTP value in production.
+      if (env.nodeEnv !== 'production') {
+        logger.debug(`📱 Resent OTP for ${phoneNumber} (${purpose}): ${otp}`);
+      } else {
+        logger.info(`📱 OTP resent for ${phoneNumber} (${purpose})`);
+      }
+
       return {
         success: true,
         message: 'OTP resent successfully',

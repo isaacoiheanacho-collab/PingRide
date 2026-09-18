@@ -19,7 +19,6 @@ import RideModel from './ride.model';
 import PaymentModel from './payment.model';
 import WalletModel from './wallet.model';
 import WalletTransactionModel from './wallet-transaction.model';
-import SettlementModel from './settlement.model';
 import DriverLedgerModel from './driver-ledger.model';
 
 // ============================================
@@ -55,14 +54,13 @@ export {
     RideRequestModel,
     RideBidModel,
     RideModel,
-    
+
     // Payment & Wallet
     PaymentModel,
     WalletModel,
     WalletTransactionModel,
-    SettlementModel,
     DriverLedgerModel,
-    
+
     // V2.0 Incentive Ecosystem
     ProgrammePeriodModel,
     PassengerQualificationModel,
@@ -71,7 +69,7 @@ export {
     RebateFundModel,
     WinnerModel,
     FraudCaseModel,
-    
+
     // Virtual Account Models
     VirtualAccountModel,
     BankTransferEventModel,
@@ -95,7 +93,6 @@ export default {
     PaymentModel,
     WalletModel,
     WalletTransactionModel,
-    SettlementModel,
     DriverLedgerModel,
     ProgrammePeriodModel,
     PassengerQualificationModel,

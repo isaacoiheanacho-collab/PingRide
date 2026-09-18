@@ -3,6 +3,7 @@ import DriverModel from '../models/driver.model';
 import VehicleModel from '../models/vehicle.model';
 import DriverDocumentModel from '../models/driver-document.model';
 import KYCModel from '../models/kyc.model';
+import { DriverSuspensionModel } from '../models/driver-suspension.model';
 import { SubaccountService } from './subaccount.service';
 import {
   IDriverProfile,
@@ -13,6 +14,7 @@ import {
 } from '../types';
 import { NotFoundError, ValidationError, ConflictError } from '../middleware/error.middleware';
 import logger from '../utils/logger';
+import pool from '../config/database';
 
 export class DriverService {
   /**
@@ -50,14 +52,8 @@ export class DriverService {
       throw new ConflictError('Driver profile already exists');
     }
 
-    // Update user role to driver if needed
-    if (user.role !== 'driver') {
-      // Note: This should be handled via a separate role update endpoint
-      // For now, we'll just create the profile
-    }
-
     const profile = await DriverModel.create(userId, data);
-    
+
     // Create initial KYC record
     await KYCModel.create(profile.id, 'pending');
 
@@ -71,7 +67,6 @@ export class DriverService {
     userId: string,
     data: IUpdateDriverProfile
   ): Promise<IDriverProfile> {
-    // ✅ Removed unused profile variable
     const updated = await DriverModel.update(userId, data);
     if (!updated) {
       throw new ValidationError('No valid fields to update');
@@ -106,7 +101,7 @@ export class DriverService {
     data: ICreateVehicle
   ): Promise<any> {
     const profile = await this.getProfile(userId);
-    
+
     // Check if registration number already exists
     const existing = await VehicleModel.getByDriverId(profile.id);
     if (existing.some(v => v.registration_number === data.registration_number)) {
@@ -126,7 +121,7 @@ export class DriverService {
   ): Promise<any> {
     const profile = await this.getProfile(userId);
     const vehicle = await VehicleModel.getById(vehicleId);
-    
+
     if (!vehicle) {
       throw new NotFoundError('Vehicle not found');
     }
@@ -150,7 +145,7 @@ export class DriverService {
   ): Promise<void> {
     const profile = await this.getProfile(userId);
     const vehicle = await VehicleModel.getById(vehicleId);
-    
+
     if (!vehicle) {
       throw new NotFoundError('Vehicle not found');
     }
@@ -163,6 +158,15 @@ export class DriverService {
 
   /**
    * Go online/offline
+   *
+   * Going ONLINE requires ALL of the following:
+   *   0. No active suspension        (driver_suspensions.status = 'suspended')
+   *   1. Legacy KYC approved         (profile.kyc_status === 'approved')
+   *   2. Driver status active        (profile.driver_status in ['active', 'approved'])
+   *   3. Phase 2C identity KYC       (profile.identity_fully_verified === true)
+   *   4. Phase 2D vehicle compliance (primary vehicle.compliance_fully_verified === true)
+   *
+   * Going OFFLINE is always allowed.
    */
   static async setAvailability(
     userId: string,
@@ -170,14 +174,45 @@ export class DriverService {
     location?: { latitude: number; longitude: number }
   ): Promise<IDriverProfile> {
     const profile = await this.getProfile(userId);
-    
-    // Check if driver is approved and KYC is complete
+
+    // ============================================
+    // GO-ONLINE GATES (only enforced when isOnline === true)
+    // ============================================
     if (isOnline) {
+      // 0. Active suspension
+      const activeSuspension = await DriverSuspensionModel.getActiveByDriver(profile.id);
+      if (activeSuspension) {
+        throw new ValidationError(
+          `You are suspended (${activeSuspension.reason_code}): ${activeSuspension.reason}. ` +
+            `Clear the outstanding issue to be reinstated.`
+        );
+      }
+
+      // 1. Legacy KYC status
       if (profile.kyc_status !== 'approved') {
         throw new ValidationError('KYC not approved');
       }
+
+      // 2. Driver status
       if (profile.driver_status !== 'active' && profile.driver_status !== 'approved') {
         throw new ValidationError('Driver not active');
+      }
+
+      // 3. Phase 2C — Identity KYC
+      if (profile.identity_fully_verified !== true) {
+        throw new ValidationError(
+          'Identity verification (Phase 2C) is not approved yet. ' +
+            'Please complete identity verification before going online.'
+        );
+      }
+
+      // 4. Phase 2D — Vehicle compliance
+      const vehicleApproved = await this.isVehicleComplianceApproved(profile.id);
+      if (!vehicleApproved) {
+        throw new ValidationError(
+          'Vehicle compliance (Phase 2D) is not approved yet. ' +
+            'Please complete vehicle compliance before going online.'
+        );
       }
     }
 
@@ -187,11 +222,11 @@ export class DriverService {
       location?.latitude,
       location?.longitude
     );
-    
+
     if (!updated) {
       throw new ValidationError('Failed to update availability');
     }
-    
+
     return updated;
   }
 
@@ -203,7 +238,7 @@ export class DriverService {
     location: IDriverLocation
   ): Promise<void> {
     const profile = await this.getProfile(userId);
-    
+
     if (!profile.is_online) {
       throw new ValidationError('Driver is offline');
     }
@@ -222,7 +257,7 @@ export class DriverService {
     const profile = await this.getProfile(userId);
     const kycRecords = await KYCModel.getByDriverId(profile.id);
     const documents = await DriverDocumentModel.getByDriverId(profile.id);
-    
+
     return {
       kyc_status: profile.kyc_status,
       records: kycRecords,
@@ -248,7 +283,7 @@ export class DriverService {
     }
   ): Promise<any> {
     const profile = await this.getProfile(userId);
-    
+
     // Update KYC status to under_review if pending
     if (profile.kyc_status === 'pending') {
       await DriverModel.updateKycStatus(profile.id, 'under_review');
@@ -266,13 +301,11 @@ export class DriverService {
   }
 
   // ============================================
-  // SUBACCOUNT MANAGEMENT (NEW)
+  // SUBACCOUNT MANAGEMENT
   // ============================================
 
   /**
    * Get driver's subaccount code
-   * @param driverId - The driver ID
-   * @returns The subaccount code or null
    */
   static async getDriverSubaccount(driverId: string): Promise<string | null> {
     const driver = await DriverModel.getById(driverId);
@@ -284,52 +317,42 @@ export class DriverService {
 
   /**
    * Ensure a driver has a subaccount
-   * If subaccount exists, returns it. If not, creates one.
-   * 
-   * @param driverId - The driver ID
-   * @returns The subaccount code
-   * @throws ValidationError if driver has no bank details
    */
   static async ensureSubaccountExists(driverId: string): Promise<string> {
-    // Check if driver already has a subaccount
     const subaccount = await this.getDriverSubaccount(driverId);
     if (subaccount) {
       logger.info(`Driver ${driverId} already has subaccount: ${subaccount}`);
       return subaccount;
     }
-    
-    // If no subaccount, try to create one
+
     const driver = await DriverModel.getById(driverId);
     if (!driver) {
       throw new NotFoundError('Driver not found');
     }
-    
+
     if (!driver.bank_code || !driver.account_number) {
       throw new ValidationError('Driver has no bank details. Please update bank details first.');
     }
-    
+
     logger.info(`Creating subaccount for driver ${driverId}`);
-    
-    // Create subaccount using SubaccountService
+
     const result = await SubaccountService.ensureDriverSubaccount(
       driverId,
       driver.bank_code,
       driver.account_number,
       driver.account_name || `${driver.first_name} ${driver.last_name}`
     );
-    
+
     if (!result.success || !result.subaccount_code) {
       throw new ValidationError(result.message || 'Failed to create subaccount');
     }
-    
+
     logger.info(`Subaccount created for driver ${driverId}: ${result.subaccount_code}`);
     return result.subaccount_code;
   }
 
   /**
    * Get driver's subaccount details
-   * @param driverId - The driver ID
-   * @returns Subaccount details from Paystack
    */
   static async getDriverSubaccountDetails(driverId: string): Promise<any> {
     return SubaccountService.getDriverSubaccountDetails(driverId);
@@ -337,11 +360,6 @@ export class DriverService {
 
   /**
    * Update driver's bank details and subaccount
-   * @param driverId - The driver ID
-   * @param bankCode - New bank code
-   * @param accountNumber - New account number
-   * @param accountName - New account name (optional)
-   * @returns Updated driver profile
    */
   static async updateDriverBankDetails(
     driverId: string,
@@ -349,13 +367,11 @@ export class DriverService {
     accountNumber: string,
     accountName?: string
   ): Promise<IDriverProfile> {
-    // Get driver
     const driver = await DriverModel.getById(driverId);
     if (!driver) {
       throw new NotFoundError('Driver not found');
     }
 
-    // Update bank details in database
     const updatedDriver = await DriverModel.updateBankDetails(driverId, {
       bank_code: bankCode,
       account_number: accountNumber,
@@ -366,7 +382,6 @@ export class DriverService {
       throw new ValidationError('Failed to update bank details');
     }
 
-    // Ensure subaccount exists
     await this.ensureSubaccountExists(driverId);
 
     logger.info(`Bank details updated for driver ${driverId}: ${bankCode}, account: ${accountNumber.slice(-4)}`);
@@ -375,8 +390,6 @@ export class DriverService {
 
   /**
    * Check if driver has a subaccount
-   * @param driverId - The driver ID
-   * @returns True if driver has an active subaccount
    */
   static async hasActiveSubaccount(driverId: string): Promise<boolean> {
     return DriverModel.hasActiveSubaccount(driverId);
@@ -384,8 +397,6 @@ export class DriverService {
 
   /**
    * Check if driver has bank details
-   * @param driverId - The driver ID
-   * @returns True if driver has bank details
    */
   static async hasBankDetails(driverId: string): Promise<boolean> {
     return DriverModel.hasBankDetails(driverId);
@@ -407,19 +418,16 @@ export class DriverService {
       throw new NotFoundError('Driver not found');
     }
 
-    // Update KYC status
     const updated = await DriverModel.updateKycStatus(driverId, 'approved');
     if (!updated) {
       throw new ValidationError('Failed to approve KYC');
     }
 
-    // Update KYC record
     const kycRecord = await KYCModel.getLatest(driverId);
     if (kycRecord) {
       await KYCModel.updateStatus(kycRecord.id, 'approved');
     }
 
-    // Update driver status to active
     await DriverModel.updateStatus(driverId, 'active');
 
     logger.info(`KYC approved for driver: ${driverId} by admin: ${adminId}`);
@@ -444,7 +452,6 @@ export class DriverService {
       throw new ValidationError('Failed to reject KYC');
     }
 
-    // Update KYC record
     const kycRecord = await KYCModel.getLatest(driverId);
     if (kycRecord) {
       await KYCModel.updateStatus(kycRecord.id, 'rejected', undefined, reason);
@@ -474,8 +481,6 @@ export class DriverService {
 
   /**
    * Admin: Get drivers without subaccounts
-   * @param limit - Maximum number of drivers to return
-   * @returns Array of drivers without subaccounts
    */
   static async getDriversWithoutSubaccount(limit: number = 100): Promise<IDriverProfile[]> {
     return DriverModel.getDriversWithoutSubaccount(limit);
@@ -483,8 +488,6 @@ export class DriverService {
 
   /**
    * Admin: Batch create subaccounts for drivers
-   * @param driverIds - Array of driver IDs
-   * @returns Batch creation results
    */
   static async batchCreateSubaccounts(
     driverIds: string[]
@@ -495,8 +498,7 @@ export class DriverService {
     results: Array<{ driverId: string; success: boolean; message: string; subaccount_code?: string }>;
   }> {
     const result = await SubaccountService.batchCreateSubaccounts(driverIds);
-    
-    // Transform to match the expected return type
+
     return {
       total: result.total,
       successful: result.successful,
@@ -512,8 +514,6 @@ export class DriverService {
 
   /**
    * Admin: Retry subaccount creation for a driver
-   * @param driverId - The driver ID
-   * @returns Updated driver profile
    */
   static async retrySubaccountCreation(driverId: string): Promise<IDriverProfile> {
     const driver = await DriverModel.getById(driverId);
@@ -525,10 +525,8 @@ export class DriverService {
       throw new ValidationError('Driver has no bank details. Please update bank details first.');
     }
 
-    // Reset status to pending
     await DriverModel.updateSubaccountStatus(driverId, 'pending');
 
-    // Create subaccount
     const result = await SubaccountService.createDriverSubaccount({
       driverId: driver.id,
       userId: driver.user_id,
@@ -543,7 +541,6 @@ export class DriverService {
       throw new ValidationError(result.message || 'Failed to create subaccount');
     }
 
-    // Get updated driver
     const updatedDriver = await DriverModel.getById(driverId);
     if (!updatedDriver) {
       throw new NotFoundError('Driver not found after subaccount creation');
@@ -551,6 +548,30 @@ export class DriverService {
 
     logger.info(`Subaccount retry successful for driver ${driverId}: ${result.subaccount_code}`);
     return updatedDriver;
+  }
+
+  // ============================================
+  // HELPER METHODS
+  // ============================================
+
+  /**
+   * Determine whether the driver's primary vehicle compliance is fully approved.
+   * Returns FALSE if no vehicle exists.
+   *
+   * Used by the go-online gate in setAvailability().
+   */
+  private static async isVehicleComplianceApproved(
+    driverId: string
+  ): Promise<boolean> {
+    const result = await pool.query(
+      `SELECT compliance_fully_verified
+       FROM vehicles
+       WHERE driver_id = $1
+       ORDER BY is_primary DESC, created_at DESC
+       LIMIT 1`,
+      [driverId]
+    );
+    return result.rows[0]?.compliance_fully_verified === true;
   }
 }
 

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import DriverController from '../controllers/driver.controller';
-import { authenticate, authorize } from '../middleware/auth.middleware';
+import { authenticate, requireVerified, authorize } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validation.middleware';
 import Joi from 'joi';
 
@@ -25,7 +25,6 @@ const createProfileSchema = Joi.object({
   has_air_conditioning: Joi.boolean().optional(),
   has_working_stereo: Joi.boolean().optional(),
   interior_air_freshener: Joi.boolean().optional(),
-  // Bank details for driver subaccount
   bank_code: Joi.string().optional(),
   account_number: Joi.string().optional(),
 });
@@ -99,10 +98,6 @@ const rejectKYCSchema = Joi.object({
   reason: Joi.string().required(),
 });
 
-// ============================================
-// BANK & SUBACCOUNT VALIDATION SCHEMAS (NEW)
-// ============================================
-
 const updateBankDetailsSchema = Joi.object({
   bank_code: Joi.string().required(),
   account_number: Joi.string().length(10).pattern(/^[0-9]{10}$/).required()
@@ -141,78 +136,184 @@ router.use(authenticate);
 // ============================================
 // PROFILE ROUTES
 // ============================================
+//
+// GET /profile stays open to any authenticated user — it's their own data.
+// Writes require verification: a pending_verification user shouldn't be
+// able to create or mutate a driver profile before OTP is verified.
 
 router.get('/profile', driverController.getProfile.bind(driverController));
-router.post('/profile', validate(createProfileSchema), driverController.createProfile.bind(driverController));
-router.patch('/profile', validate(updateProfileSchema), driverController.updateProfile.bind(driverController));
+
+router.post(
+  '/profile',
+  requireVerified(),
+  validate(createProfileSchema),
+  driverController.createProfile.bind(driverController)
+);
+
+router.patch(
+  '/profile',
+  requireVerified(),
+  validate(updateProfileSchema),
+  driverController.updateProfile.bind(driverController)
+);
 
 // ============================================
-// BANK & SUBACCOUNT ROUTES (NEW)
+// BANK & SUBACCOUNT ROUTES
 // ============================================
 
-// Get list of banks for dropdown
+// Reference data — open to any authenticated user
 router.get('/banks', driverController.getBanks.bind(driverController));
-
-// Get popular banks
 router.get('/banks/popular', driverController.getPopularBanks.bind(driverController));
 
-// Get driver bank details
+// Read own bank details — open
 router.get('/bank-details', driverController.getBankDetails.bind(driverController));
 
-// Update bank details and create subaccount
-router.post('/bank-details', validate(updateBankDetailsSchema), driverController.updateBankDetails.bind(driverController));
-
-// Validate bank account without saving
-router.post('/validate-bank', validate(validateBankSchema), driverController.validateBankAccount.bind(driverController));
-
-// Get subaccount details from Paystack
+// Read own subaccount — open
 router.get('/subaccount', driverController.getSubaccountDetails.bind(driverController));
+
+// Write bank details and create subaccount — verified only
+router.post(
+  '/bank-details',
+  requireVerified(),
+  validate(updateBankDetailsSchema),
+  driverController.updateBankDetails.bind(driverController)
+);
+
+// Stateless account validation — safe for any authenticated driver.
+// (It resolves a name; no persistence, no money.)
+router.post(
+  '/validate-bank',
+  validate(validateBankSchema),
+  driverController.validateBankAccount.bind(driverController)
+);
 
 // ============================================
 // VEHICLE ROUTES
 // ============================================
 
+// Read own vehicles — open
 router.get('/vehicles', driverController.getVehicles.bind(driverController));
-router.post('/vehicles', validate(createVehicleSchema), driverController.addVehicle.bind(driverController));
-router.patch('/vehicles/:vehicleId', validate(updateVehicleSchema), driverController.updateVehicle.bind(driverController));
-router.delete('/vehicles/:vehicleId', driverController.deleteVehicle.bind(driverController));
+
+// Write — verified only
+router.post(
+  '/vehicles',
+  requireVerified(),
+  validate(createVehicleSchema),
+  driverController.addVehicle.bind(driverController)
+);
+
+router.patch(
+  '/vehicles/:vehicleId',
+  requireVerified(),
+  validate(updateVehicleSchema),
+  driverController.updateVehicle.bind(driverController)
+);
+
+router.delete(
+  '/vehicles/:vehicleId',
+  requireVerified(),
+  driverController.deleteVehicle.bind(driverController)
+);
 
 // ============================================
 // AVAILABILITY ROUTES
 // ============================================
 
-router.post('/online', driverController.goOnline.bind(driverController));
-router.post('/offline', driverController.goOffline.bind(driverController));
+router.post(
+  '/online',
+  requireVerified(),
+  driverController.goOnline.bind(driverController)
+);
+
+router.post(
+  '/offline',
+  requireVerified(),
+  driverController.goOffline.bind(driverController)
+);
 
 // ============================================
 // LOCATION ROUTES
 // ============================================
 
-router.post('/location', validate(updateLocationSchema), driverController.updateLocation.bind(driverController));
+router.post(
+  '/location',
+  requireVerified(),
+  validate(updateLocationSchema),
+  driverController.updateLocation.bind(driverController)
+);
 
 // ============================================
 // KYC & DOCUMENT ROUTES
 // ============================================
 
+// Read KYC status and documents — open
 router.get('/kyc', driverController.getKYCStatus.bind(driverController));
 router.get('/documents', driverController.getDocuments.bind(driverController));
-router.post('/documents', validate(submitDocumentSchema), driverController.submitDocument.bind(driverController));
+
+// Submit KYC document — verified only
+router.post(
+  '/documents',
+  requireVerified(),
+  validate(submitDocumentSchema),
+  driverController.submitDocument.bind(driverController)
+);
 
 // ============================================
 // ADMIN ROUTES
 // ============================================
 
 // Admin: KYC Management
-router.patch('/admin/kyc/:driverId/approve', authorize('admin', 'super_admin'), driverController.approveKYC.bind(driverController));
-router.patch('/admin/kyc/:driverId/reject', authorize('admin', 'super_admin'), validate(rejectKYCSchema), driverController.rejectKYC.bind(driverController));
+router.patch(
+  '/admin/kyc/:driverId/approve',
+  requireVerified(),
+  authorize('admin', 'super_admin'),
+  driverController.approveKYC.bind(driverController)
+);
+
+router.patch(
+  '/admin/kyc/:driverId/reject',
+  requireVerified(),
+  authorize('admin', 'super_admin'),
+  validate(rejectKYCSchema),
+  driverController.rejectKYC.bind(driverController)
+);
 
 // Admin: Driver Management
-router.get('/admin/active', authorize('admin', 'super_admin'), driverController.getActiveDrivers.bind(driverController));
-router.get('/admin/near', authorize('admin', 'super_admin'), driverController.getDriversNear.bind(driverController));
+router.get(
+  '/admin/active',
+  requireVerified(),
+  authorize('admin', 'super_admin'),
+  driverController.getActiveDrivers.bind(driverController)
+);
+
+router.get(
+  '/admin/near',
+  requireVerified(),
+  authorize('admin', 'super_admin'),
+  driverController.getDriversNear.bind(driverController)
+);
 
 // Admin: Subaccount Management
-router.get('/admin/no-subaccount', authorize('admin', 'super_admin'), driverController.getDriversWithoutSubaccount.bind(driverController));
-router.post('/admin/batch-subaccount', authorize('admin', 'super_admin'), validate(batchSubaccountSchema), driverController.batchCreateSubaccounts.bind(driverController));
-router.post('/admin/retry-subaccount/:driverId', authorize('admin', 'super_admin'), driverController.retrySubaccount.bind(driverController));
+router.get(
+  '/admin/no-subaccount',
+  requireVerified(),
+  authorize('admin', 'super_admin'),
+  driverController.getDriversWithoutSubaccount.bind(driverController)
+);
+
+router.post(
+  '/admin/batch-subaccount',
+  requireVerified(),
+  authorize('admin', 'super_admin'),
+  validate(batchSubaccountSchema),
+  driverController.batchCreateSubaccounts.bind(driverController)
+);
+
+router.post(
+  '/admin/retry-subaccount/:driverId',
+  requireVerified(),
+  authorize('admin', 'super_admin'),
+  driverController.retrySubaccount.bind(driverController)
+);
 
 export default router;

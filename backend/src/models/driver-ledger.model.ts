@@ -3,9 +3,9 @@
 // ============================================
 
 import pool from '../config/database';
-import { 
-  IDriverLedger, 
-  IDriverLedgerTransaction 
+import {
+  IDriverLedger,
+  IDriverLedgerTransaction
 } from '../types/payment.types';
 import logger from '../utils/logger';
 
@@ -376,6 +376,127 @@ export class DriverLedgerModel {
   }
 
   // ============================================
+  // INFORMATIONAL RECORDING (V2.0)
+  // ============================================
+  //
+  // The driver ledger is now informational only.
+  // Paystack splits each ride payment directly to the driver's
+  // subaccount — real money never flows through this ledger.
+  //
+  // These methods write transaction rows so the driver's app can
+  // display earnings history, but they do NOT change
+  // driver_ledger.net_balance or driver_ledger.withdrawable_balance.
+  //
+  // balance_before = balance_after = current net_balance (unchanged).
+
+  /**
+   * Record an earning row (informational only, no balance change)
+   * Called after a split payment succeeds via Paystack.
+   */
+  static async recordEarningInformational(
+    driverId: string,
+    amount: number,
+    reference: string,
+    description?: string,
+    metadata?: any
+  ): Promise<IDriverLedgerTransaction | null> {
+    const ledger = await this.getByDriverId(driverId);
+    if (!ledger) {
+      logger.warn(
+        `recordEarningInformational: no ledger found for driver ${driverId}`
+      );
+      return null;
+    }
+
+    const currentBalance = parseFloat(String(ledger.net_balance)) || 0;
+
+    const result = await pool.query(
+      `INSERT INTO driver_ledger_transactions (
+        driver_ledger_id,
+        transaction_type,
+        amount,
+        balance_before,
+        balance_after,
+        reference_type,
+        reference_id,
+        description,
+        metadata,
+        status,
+        completed_at
+      ) VALUES ($1, 'earning', $2, $3, $4, 'payment', $5, $6, $7, 'completed', NOW())
+      RETURNING *`,
+      [
+        ledger.id,
+        amount,
+        currentBalance,
+        currentBalance,
+        reference,
+        description || `Ride earning (informational) — ref ${reference}`,
+        metadata || null,
+      ]
+    );
+
+    logger.debug(
+      `Informational earning recorded for driver ${driverId}: ${amount} (ref ${reference})`
+    );
+    return result.rows[0] || null;
+  }
+
+  /**
+   * Record a commission row (informational only, no balance change)
+   * Called alongside recordEarningInformational when a split
+   * payment succeeds, so the driver's app can show gross / net.
+   */
+  static async recordCommissionInformational(
+    driverId: string,
+    amount: number,
+    reference: string,
+    description?: string,
+    metadata?: any
+  ): Promise<IDriverLedgerTransaction | null> {
+    const ledger = await this.getByDriverId(driverId);
+    if (!ledger) {
+      logger.warn(
+        `recordCommissionInformational: no ledger found for driver ${driverId}`
+      );
+      return null;
+    }
+
+    const currentBalance = parseFloat(String(ledger.net_balance)) || 0;
+
+    const result = await pool.query(
+      `INSERT INTO driver_ledger_transactions (
+        driver_ledger_id,
+        transaction_type,
+        amount,
+        balance_before,
+        balance_after,
+        reference_type,
+        reference_id,
+        description,
+        metadata,
+        status,
+        completed_at
+      ) VALUES ($1, 'commission', $2, $3, $4, 'payment', $5, $6, $7, 'completed', NOW())
+      RETURNING *`,
+      [
+        ledger.id,
+        amount,
+        currentBalance,
+        currentBalance,
+        reference,
+        description || `Ride commission (informational) — ref ${reference}`,
+        metadata || null,
+      ]
+    );
+
+    logger.debug(
+      `Informational commission recorded for driver ${driverId}: ${amount} (ref ${reference})`
+    );
+    return result.rows[0] || null;
+  }
+
+  // ============================================
   // DEPRECATED WRITE METHODS (Kept for rollback)
   // ============================================
 
@@ -386,7 +507,7 @@ export class DriverLedgerModel {
    */
   static async create(driverId: string): Promise<IDriverLedger> {
     console.warn('⚠️ DriverLedgerModel.create() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `INSERT INTO driver_ledger (
         driver_id
@@ -405,7 +526,7 @@ export class DriverLedgerModel {
    */
   static async createIfNotExists(driverId: string): Promise<IDriverLedger> {
     console.warn('⚠️ DriverLedgerModel.createIfNotExists() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const existing = await this.getByDriverId(driverId);
     if (existing) {
       return existing;
@@ -423,7 +544,7 @@ export class DriverLedgerModel {
     status: 'active' | 'suspended' | 'closed'
   ): Promise<IDriverLedger | null> {
     console.warn('⚠️ DriverLedgerModel.updateStatus() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `UPDATE driver_ledger 
        SET status = $1, updated_at = NOW()
@@ -444,7 +565,7 @@ export class DriverLedgerModel {
     amount: number
   ): Promise<IDriverLedger | null> {
     console.warn('⚠️ DriverLedgerModel.addDigitalEarnings() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `UPDATE driver_ledger 
        SET digital_earnings = digital_earnings + $1,
@@ -468,7 +589,7 @@ export class DriverLedgerModel {
     amount: number
   ): Promise<IDriverLedger | null> {
     console.warn('⚠️ DriverLedgerModel.addBonus() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `UPDATE driver_ledger 
        SET bonus_earnings = bonus_earnings + $1,
@@ -492,7 +613,7 @@ export class DriverLedgerModel {
     amount: number
   ): Promise<IDriverLedger | null> {
     console.warn('⚠️ DriverLedgerModel.addAdjustment() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `UPDATE driver_ledger 
        SET adjustment_earnings = adjustment_earnings + $1,
@@ -516,7 +637,7 @@ export class DriverLedgerModel {
     amount: number
   ): Promise<IDriverLedger | null> {
     console.warn('⚠️ DriverLedgerModel.deductCommission() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `UPDATE driver_ledger 
        SET total_commission_deducted = total_commission_deducted + $1,
@@ -540,7 +661,7 @@ export class DriverLedgerModel {
     amount: number
   ): Promise<IDriverLedger | null> {
     console.warn('⚠️ DriverLedgerModel.addCashCommissionDebt() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `UPDATE driver_ledger 
        SET cash_commission_debt = cash_commission_debt + $1,
@@ -563,7 +684,7 @@ export class DriverLedgerModel {
     amount: number
   ): Promise<IDriverLedger | null> {
     console.warn('⚠️ DriverLedgerModel.deductWithdrawal() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `UPDATE driver_ledger 
        SET total_withdrawals = total_withdrawals + $1,
@@ -586,7 +707,7 @@ export class DriverLedgerModel {
     amount: number
   ): Promise<IDriverLedger | null> {
     console.warn('⚠️ DriverLedgerModel.addRefund() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `UPDATE driver_ledger 
        SET total_refunds = total_refunds + $1,
@@ -618,7 +739,7 @@ export class DriverLedgerModel {
     status?: string;
   }): Promise<IDriverLedgerTransaction> {
     console.warn('⚠️ DriverLedgerModel.createTransaction() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const result = await pool.query(
       `INSERT INTO driver_ledger_transactions (
         driver_ledger_id,
@@ -661,7 +782,7 @@ export class DriverLedgerModel {
     status: 'pending' | 'completed' | 'failed' | 'reversed'
   ): Promise<IDriverLedgerTransaction | null> {
     console.warn('⚠️ DriverLedgerModel.updateTransactionStatus() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+
     const updates = [`status = $1`, `updated_at = NOW()`];
     const params: any[] = [status];
 

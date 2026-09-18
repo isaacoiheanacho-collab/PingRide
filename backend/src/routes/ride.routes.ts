@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import RideController from '../controllers/ride.controller';
-import { authenticate } from '../middleware/auth.middleware';
+import { authenticate, requireVerified } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validation.middleware';
 import Joi from 'joi';
 
@@ -11,7 +11,6 @@ const rideController = new RideController();
 // VALIDATION SCHEMAS
 // ============================================
 
-// Validation schemas - UPDATED to match database CHECK constraint
 const createRideRequestSchema = Joi.object({
   pickup_latitude: Joi.number().min(-90).max(90).required(),
   pickup_longitude: Joi.number().min(-180).max(180).required(),
@@ -29,14 +28,13 @@ const submitBidSchema = Joi.object({
   driver_notes: Joi.string().optional(),
 });
 
-// UPDATED: Status validation to match database CHECK constraint
 const updateRideStatusSchema = Joi.object({
   status: Joi.string().valid(
     'confirmed',
-    'driver_en_route', 
-    'driver_arrived', 
-    'ride_started', 
-    'ride_in_progress', 
+    'driver_en_route',
+    'driver_arrived',
+    'ride_started',
+    'ride_in_progress',
     'ride_completed',
     'cancelled',
     'failed',
@@ -62,6 +60,7 @@ const cancelRideSchema = Joi.object({
 router.post(
   '/requests',
   authenticate,
+  requireVerified(),
   validate(createRideRequestSchema),
   rideController.createRideRequest.bind(rideController)
 );
@@ -70,6 +69,7 @@ router.post(
 router.get(
   '/requests/:rideRequestId',
   authenticate,
+  requireVerified(),
   rideController.getRideRequest.bind(rideController)
 );
 
@@ -77,6 +77,7 @@ router.get(
 router.get(
   '/requests/:rideRequestId/bids',
   authenticate,
+  requireVerified(),
   rideController.getBids.bind(rideController)
 );
 
@@ -88,6 +89,7 @@ router.get(
 router.post(
   '/bids',
   authenticate,
+  requireVerified(),
   validate(submitBidSchema),
   rideController.submitBid.bind(rideController)
 );
@@ -100,6 +102,7 @@ router.post(
 router.post(
   '/requests/:rideRequestId/bids/:bidId/select',
   authenticate,
+  requireVerified(),
   rideController.selectBid.bind(rideController)
 );
 
@@ -111,6 +114,7 @@ router.post(
 router.get(
   '/:rideId',
   authenticate,
+  requireVerified(),
   rideController.getRide.bind(rideController)
 );
 
@@ -118,6 +122,7 @@ router.get(
 router.patch(
   '/:rideId/status',
   authenticate,
+  requireVerified(),
   validate(updateRideStatusSchema),
   rideController.updateRideStatus.bind(rideController)
 );
@@ -126,72 +131,56 @@ router.patch(
 router.post(
   '/:rideId/cancel',
   authenticate,
+  requireVerified(),
   validate(cancelRideSchema),
   rideController.cancelRide.bind(rideController)
 );
 
 // ============================================
-// PAYMENT ROUTES (NEW - Task 6)
+// PAYMENT ROUTES
 // ============================================
 
 /**
  * Initiate payment for a completed ride
  * POST /api/v1/rides/:rideId/pay
- * 
- * This endpoint initiates a split payment for a completed ride.
- * The payment is processed via Paystack with automatic split to:
- * - Driver subaccount (82.5%)
- * - PingRide subaccount (15%)
- * - Rebate subaccount (1.5%)
- * 
- * No request body required - ride_id is in the URL
  */
 router.post(
   '/:rideId/pay',
   authenticate,
+  requireVerified(),
   rideController.payForRide.bind(rideController)
 );
 
 /**
  * Check if a ride is ready for payment
  * GET /api/v1/rides/:rideId/pay/check
- * 
- * This endpoint checks if a ride is ready for payment without initiating it.
- * Useful for UI to show payment button or status.
- * 
- * No request body required - ride_id is in the URL
  */
 router.get(
   '/:rideId/pay/check',
   authenticate,
+  requireVerified(),
   rideController.checkPaymentEligibility.bind(rideController)
 );
 
 /**
  * Get payment status for a ride
  * GET /api/v1/rides/:rideId/payment-status
- * 
- * This endpoint returns the payment status for a ride.
- * 
- * No request body required - ride_id is in the URL
  */
 router.get(
   '/:rideId/payment-status',
   authenticate,
+  requireVerified(),
   rideController.getPaymentStatus.bind(rideController)
 );
 
 /**
  * Get full ride details with payment and incentive data
  * GET /api/v1/rides/:rideId/full
- * 
- * This endpoint returns full ride details including payment status and incentive data.
- * 
- * No request body required - ride_id is in the URL
  */
 router.get(
   '/:rideId/full',
   authenticate,
+  requireVerified(),
   rideController.getFullRideDetails.bind(rideController)
 );
 
@@ -203,6 +192,7 @@ router.get(
 router.get(
   '/driver/active',
   authenticate,
+  requireVerified(),
   rideController.getActiveRidesForDriver.bind(rideController)
 );
 
@@ -210,6 +200,7 @@ router.get(
 router.get(
   '/passenger/active',
   authenticate,
+  requireVerified(),
   rideController.getActiveRidesForPassenger.bind(rideController)
 );
 
@@ -221,6 +212,7 @@ router.get(
 router.get(
   '/passenger/history',
   authenticate,
+  requireVerified(),
   rideController.getRideHistory.bind(rideController)
 );
 

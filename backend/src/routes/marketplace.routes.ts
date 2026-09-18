@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import MarketplaceController from '../controllers/marketplace.controller';
-import { authenticate } from '../middleware/auth.middleware';
+import { authenticate, requireVerified } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validation.middleware';
 import Joi from 'joi';
 
@@ -25,46 +25,66 @@ const submitBidSchema = Joi.object({
   driver_notes: Joi.string().optional(),
 });
 
-// Passenger routes
+// ============================================
+// PASSENGER ROUTES
+// ============================================
+
 router.post(
   '/request',
   authenticate,
+  requireVerified(),
   validate(requestRideSchema),
   marketplaceController.requestRide.bind(marketplaceController)
 );
+
 router.get(
   '/requests/:rideRequestId',
   authenticate,
+  requireVerified(),
   marketplaceController.getRideRequestWithBids.bind(marketplaceController)
 );
+
 router.post(
   '/requests/:rideRequestId/bids/:bidId/select',
   authenticate,
+  requireVerified(),
   marketplaceController.selectBid.bind(marketplaceController)
 );
+
 router.get(
   '/passenger/active',
   authenticate,
+  requireVerified(),
   marketplaceController.getActiveRideForPassenger.bind(marketplaceController)
 );
 
-// Driver routes
+// ============================================
+// DRIVER ROUTES
+// ============================================
+
 router.post(
   '/bids',
   authenticate,
+  requireVerified(),
   validate(submitBidSchema),
   marketplaceController.submitBid.bind(marketplaceController)
 );
+
 router.get(
   '/driver/active',
   authenticate,
+  requireVerified(),
   marketplaceController.getActiveRideForDriver.bind(marketplaceController)
 );
 
-// Admin/Utility routes
+// ============================================
+// ADMIN / UTILITY ROUTES
+// ============================================
+
 router.get(
   '/eligible-drivers',
   authenticate,
+  requireVerified(),
   marketplaceController.getEligibleDrivers.bind(marketplaceController)
 );
 

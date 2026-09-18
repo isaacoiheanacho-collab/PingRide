@@ -5,15 +5,15 @@ import { DriverModel } from '../models/driver.model';
 import { OTPService } from './otp.service';
 import { generateTokens, verifyRefreshToken } from '../utils/jwt';
 import { VirtualAccountService } from './virtual-account.service';
-import { BankService } from './bank.service';
 import { SubaccountService } from './subaccount.service';
-import { 
-  IRegisterRequest, 
-  ILoginRequest, 
+import {
+  IRegisterRequest,
+  ILoginRequest,
   IAuthResponse,
   IRefreshTokenRequest,
   IChangePasswordRequest,
-  IResetPasswordConfirmRequest
+  IResetPasswordConfirmRequest,
+  IOnboardingState,
 } from '../types';
 import { ConflictError, UnauthorizedError, ValidationError, NotFoundError } from '../middleware/error.middleware';
 import logger from '../utils/logger';
@@ -22,224 +22,84 @@ export class AuthService {
   private static readonly SALT_ROUNDS = 12;
 
   /**
-   * Register a new user - with virtual account provisioning and KYC
-   * 
-   * Integration Flow:
-   * 1. Validate user input (phone, email, password)
-   * 2. Create user in database
-   * 3. Send OTP for verification
-   * 4. Create passenger profile with KYC data (if passenger)
-   * 5. Create driver profile with subaccount (if driver)
-   * 6. Provision Virtual Account (DVA) with split support (if passenger)
-   * 7. Generate JWT tokens
-   * 8. Return user data and tokens
+   * Phase 1 — General Registration
+   *
+   * Collects only: first_name, last_name, phone_number, password, user_type.
+   * Creates the user in `pending_verification` state and a minimal profile.
+   * Sends OTP. Does NOT provision DVA, subaccount, KYC, or issue tokens.
+   * Phase 1 completes when the user verifies their OTP.
    */
   static async register(data: IRegisterRequest): Promise<IAuthResponse> {
     // ============================================
-    // STEP 1: VALIDATE USER INPUT
+    // STEP 1: DUPLICATE CHECK
     // ============================================
-    
-    // Check if phone already exists
+
     const phoneExists = await UserModel.phoneExists(data.phone_number);
     if (phoneExists) {
       throw new ConflictError('Phone number already registered');
-    }
-
-    // Check if email exists (if provided)
-    if (data.email) {
-      const emailExists = await UserModel.emailExists(data.email);
-      if (emailExists) {
-        throw new ConflictError('Email already registered');
-      }
-    }
-
-    // Validate BVN/NIN if provided
-    if (data.bvn && !this.validateBVN(data.bvn)) {
-      throw new ValidationError('Invalid BVN format. BVN must be 11 digits.');
-    }
-    if (data.nin && !this.validateNIN(data.nin)) {
-      throw new ValidationError('Invalid NIN format. NIN must be 11 digits.');
-    }
-
-    // Validate driver bank details if provided
-    if (data.user_type === 'driver' && data.bank_code && data.account_number) {
-      // Validate bank code exists
-      const isValidBank = await BankService.isValidBankCode(data.bank_code);
-      if (!isValidBank) {
-        throw new ValidationError('Invalid bank code. Please select a valid bank.');
-      }
-      
-      // Validate account number format (10 digits for Nigeria)
-      if (!/^[0-9]{10}$/.test(data.account_number)) {
-        throw new ValidationError('Account number must be 10 digits.');
-      }
     }
 
     // ============================================
     // STEP 2: CREATE USER
     // ============================================
 
-    // Hash password
     const passwordHash = await bcrypt.hash(data.password, this.SALT_ROUNDS);
 
-    // Create user
     const user = await UserModel.create(
       data.phone_number,
       passwordHash,
-      data.user_type,
-      data.email
+      data.user_type
     );
 
     // ============================================
-    // STEP 3: SEND OTP
+    // STEP 3: CREATE MINIMAL PROFILE
+    // Only first_name + last_name.
+    // KYC / bank / license / vehicle fields arrive in Phase 2+.
     // ============================================
 
-    // Send OTP for phone verification
-    await OTPService.sendOTP(data.phone_number, 'registration');
-
-    // ============================================
-    // STEP 4: CREATE PASSENGER PROFILE (if passenger)
-    // ============================================
-    
     if (data.user_type === 'passenger') {
       try {
         await PassengerModel.createProfile(user.id, {
           first_name: data.first_name,
           last_name: data.last_name,
-          profile_photo_url: data.profile_photo_url,
-          date_of_birth: data.date_of_birth,
-          gender: data.gender,
-          bvn: data.bvn,
-          nin: data.nin,
-          kyc_status: data.bvn || data.nin ? 'pending' : 'pending',
         });
-        logger.info(`Passenger profile created for user: ${user.id}`);
+        logger.info(`Minimal passenger profile created for user: ${user.id}`);
       } catch (error) {
         logger.error(`Failed to create passenger profile for user ${user.id}:`, error);
-        // Don't block registration if profile creation fails
+        // Don't block registration if profile creation fails;
+        // the client can retry Phase 1 or an admin can repair it.
       }
-    }
-
-    // ============================================
-    // STEP 5: CREATE DRIVER PROFILE WITH SUBACCOUNT (if driver)
-    // ============================================
-    
-    if (data.user_type === 'driver') {
+    } else if (data.user_type === 'driver') {
       try {
-        // 5.1: Create driver profile
-        const driver = await DriverModel.create(user.id, {
+        await DriverModel.create(user.id, {
           first_name: data.first_name,
           last_name: data.last_name,
-          profile_photo_url: data.profile_photo_url,
-          date_of_birth: data.date_of_birth,
-          driver_license_number: data.driver_license_number || '',
-          driver_license_expiry: data.driver_license_expiry || new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-          address: data.address,
-          state_of_origin: data.state_of_origin,
-          emergency_contact_name: data.emergency_contact_name,
-          emergency_contact_phone: data.emergency_contact_phone,
-          has_air_conditioning: data.has_air_conditioning,
-          has_working_stereo: data.has_working_stereo,
-          interior_air_freshener: data.interior_air_freshener,
-          // Bank details for subaccount
-          bank_code: data.bank_code,
-          account_number: data.account_number,
         });
-        logger.info(`Driver profile created for user: ${user.id}`);
-
-        // 5.2: Validate and store bank details if provided
-        if (data.bank_code && data.account_number) {
-          try {
-            const validation = await BankService.validateBankAccount(
-              data.bank_code,
-              data.account_number
-            );
-            
-            if (!validation.valid) {
-              logger.warn(`Bank account validation failed for driver ${driver.id}: ${validation.message}`);
-              // Don't throw - driver can update bank details later
-            } else {
-              // Update driver with validated account name
-              await DriverModel.updateBankDetails(driver.id, {
-                bank_code: data.bank_code,
-                account_number: data.account_number,
-                account_name: validation.account_name || `${data.first_name} ${data.last_name}`,
-              });
-              
-              // 5.3: Create Paystack subaccount
-              try {
-                const subaccountResult = await SubaccountService.createDriverSubaccount({
-                  driverId: driver.id,
-                  userId: user.id,
-                  firstName: data.first_name,
-                  lastName: data.last_name,
-                  bankCode: data.bank_code,
-                  accountNumber: data.account_number,
-                  accountName: validation.account_name || `${data.first_name} ${data.last_name}`,
-                  phoneNumber: data.phone_number,
-                  email: data.email,
-                });
-
-                if (subaccountResult.success) {
-                  logger.info(`Subaccount created for driver ${driver.id}: ${subaccountResult.subaccount_code}`);
-                } else {
-                  logger.warn(`Subaccount creation failed for driver ${driver.id}: ${subaccountResult.message}`);
-                  // Driver can retry later via admin or update bank details
-                }
-              } catch (subaccountError) {
-                logger.error(`Failed to create subaccount for driver ${driver.id}:`, subaccountError);
-                // Don't block registration if subaccount creation fails
-                // Driver can retry later
-              }
-            }
-          } catch (validationError) {
-            logger.error(`Bank validation error for driver ${driver.id}:`, validationError);
-            // Don't block registration - driver can update bank details later
-          }
-        } else {
-          logger.info(`Driver ${driver.id} registered without bank details. They can add bank details later.`);
-        }
-
+        logger.info(`Minimal driver profile created for user: ${user.id}`);
       } catch (error) {
-        logger.error(`Failed to complete driver registration for user ${user.id}:`, error);
-        // Don't block registration if driver profile creation fails
-        // User can complete driver profile later
+        logger.error(`Failed to create driver profile for user ${user.id}:`, error);
+        // Same as above — don't block registration.
       }
     }
 
     // ============================================
-    // STEP 6: PROVISION VIRTUAL ACCOUNT (DVA) for PASSENGERS
-    // ============================================
-    
-    if (data.user_type === 'passenger') {
-      try {
-        const splitConfig = await this.getDefaultSplitConfig();
-        
-        await VirtualAccountService.provisionVirtualAccount(
-          user.id,
-          splitConfig
-        );
-        logger.info(`Virtual account provisioned for new passenger: ${user.id}`, {
-          has_split: !!splitConfig?.split_code || !!splitConfig?.subaccount,
-        });
-      } catch (error) {
-        // Don't block registration if virtual account fails
-        // Log and continue - can be retried later
-        logger.error(`Failed to provision virtual account for user ${user.id}:`, error);
-      }
-    }
-
-    // ============================================
-    // STEP 7: GENERATE TOKENS
+    // STEP 4: SEND OTP
     // ============================================
 
-    const tokens = generateTokens(user);
+    await OTPService.sendOTP(data.phone_number, 'registration');
 
     // ============================================
-    // STEP 8: RETURN RESPONSE
+    // STEP 5: RETURN
+    // No tokens yet — they are issued after OTP verification.
     // ============================================
 
-    logger.info(`User registered: ${user.id} (${user.phone_number})`);
+    logger.info(`User registered (Phase 1): ${user.id} (${user.phone_number}) [${user.role}]`);
+
+    const onboarding: IOnboardingState = {
+      phase: 'awaiting_otp',
+      next_step: 'verify_otp',
+      completed: false,
+    };
 
     return {
       user: {
@@ -251,17 +111,33 @@ export class AuthService {
         role: user.role,
         status: user.status,
       },
-      tokens,
+      onboarding,
     };
   }
 
   /**
-   * Verify OTP for registration
+   * Verify OTP — completes Phase 1
+   *
+   * Activates the user, issues tokens, and returns the onboarding state
+   * indicating which Phase 2 step is next (passenger_kyc or driver_bank).
    */
   static async verifyRegistrationOTP(
     phoneNumber: string,
     otp: string
-  ): Promise<{ success: boolean; user: any }> {
+  ): Promise<{
+    success: boolean;
+    user: {
+      id: string;
+      phone_number: string;
+      email?: string;
+      first_name: string;
+      last_name: string;
+      role: string;
+      status: string;
+    };
+    tokens: ReturnType<typeof generateTokens>;
+    onboarding: IOnboardingState;
+  }> {
     // Verify OTP
     const result = await OTPService.verifyOTP(phoneNumber, otp, 'registration');
     if (!result.valid) {
@@ -274,34 +150,75 @@ export class AuthService {
       throw new NotFoundError('User not found');
     }
 
-    // Update user status
+    // Activate user
     await UserModel.verifyPhone(user.id);
 
-    logger.info(`User verified: ${user.id} (${user.phone_number})`);
+    // Reload so we get the fresh status
+    const freshUser = await UserModel.findById(user.id);
+    if (!freshUser) {
+      throw new NotFoundError('User not found after verification');
+    }
+
+    // Fetch names from the profile created in Phase 1
+    let firstName = '';
+    let lastName = '';
+
+    if (freshUser.role === 'passenger') {
+      const profile = await PassengerModel.getProfile(freshUser.id);
+      if (profile) {
+        firstName = profile.first_name || '';
+        lastName = profile.last_name || '';
+      }
+    } else if (freshUser.role === 'driver') {
+      const profile = await DriverModel.getByUserId(freshUser.id);
+      if (profile) {
+        firstName = profile.first_name || '';
+        lastName = profile.last_name || '';
+      }
+    }
+
+    // Issue tokens now that the phone is verified
+    const tokens = generateTokens(freshUser);
+
+    // Next step depends on role
+    const nextStep: IOnboardingState['next_step'] =
+      freshUser.role === 'driver' ? 'driver_bank' : 'passenger_kyc';
+
+    const onboarding: IOnboardingState = {
+      phase: 'role_onboarding',
+      next_step: nextStep,
+      completed: false,
+    };
+
+    logger.info(`User verified (Phase 1 complete): ${freshUser.id} (${freshUser.phone_number})`);
 
     return {
       success: true,
       user: {
-        id: user.id,
-        phone_number: user.phone_number,
-        email: user.email,
-        role: user.role,
-        status: 'active',
+        id: freshUser.id,
+        phone_number: freshUser.phone_number,
+        email: freshUser.email,
+        first_name: firstName,
+        last_name: lastName,
+        role: freshUser.role,
+        status: freshUser.status,
       },
+      tokens,
+      onboarding,
     };
   }
 
   /**
    * Login user
-   * 
-   * Integration Flow:
-   * 1. Find user by phone
-   * 2. Check account status (locked, active, verified)
-   * 3. Verify password
-   * 4. Reset login attempts
-   * 5. Update last login
-   * 6. Generate JWT tokens
-   * 7. Return user data with profile info
+   *
+   * Accepts both `active` and `pending_verification` users. A pending user
+   * receives tokens so they can complete OTP verification inside the app
+   * (avoids re-registration and avoids the SMS cost of sending another OTP
+   * just to hold a session).
+   *
+   * Sensitive routes are gated by the `requireVerified` middleware — the
+   * tokens a pending user receives only unlock profile and onboarding
+   * endpoints.
    */
   static async login(data: ILoginRequest): Promise<IAuthResponse> {
     // STEP 1: Find user by phone
@@ -315,12 +232,10 @@ export class AuthService {
       throw new UnauthorizedError('Account locked. Please try again later');
     }
 
+    // Reject suspended / deactivated / locked outright.
+    // Allow 'active' and 'pending_verification'.
     if (user.status !== 'active' && user.status !== 'pending_verification') {
       throw new UnauthorizedError(`Account ${user.status}`);
-    }
-
-    if (user.status === 'pending_verification' && !user.phone_verified) {
-      throw new UnauthorizedError('Phone number not verified');
     }
 
     // STEP 3: Verify password
@@ -344,7 +259,7 @@ export class AuthService {
     let lastName = '';
     let subaccountCode: string | undefined;
     let subaccountStatus: string | undefined;
-    
+
     if (user.role === 'passenger') {
       const passenger = await PassengerModel.getProfile(user.id);
       if (passenger) {
@@ -361,7 +276,13 @@ export class AuthService {
       }
     }
 
-    logger.info(`User logged in: ${user.id} (${user.phone_number})`);
+    // STEP 8: Compute onboarding state (derived)
+    // Pending users get `awaiting_otp` before any role-specific step.
+    const onboarding = await this.getOnboardingState(user.id, user.role, user.status, {
+      subaccountStatus,
+    });
+
+    logger.info(`User logged in: ${user.id} (${user.phone_number}) [status=${user.status}]`);
 
     return {
       user: {
@@ -377,13 +298,20 @@ export class AuthService {
         ...(subaccountStatus && { subaccount_status: subaccountStatus }),
       },
       tokens,
+      onboarding,
     };
   }
 
   /**
    * Refresh access token
+   *
+   * Accepts both `active` and `pending_verification` users so a pending
+   * user's token can be refreshed without forcing them to log in again.
+   * Suspended / deactivated / locked users are still rejected.
    */
-  static async refreshToken(data: IRefreshTokenRequest): Promise<{ accessToken: string; expiresIn: number }> {
+  static async refreshToken(
+    data: IRefreshTokenRequest
+  ): Promise<{ accessToken: string; expiresIn: number }> {
     const decoded = verifyRefreshToken(data.refresh_token);
     if (!decoded) {
       throw new UnauthorizedError('Invalid refresh token');
@@ -395,8 +323,8 @@ export class AuthService {
       throw new UnauthorizedError('User not found');
     }
 
-    // Check if user is active
-    if (user.status !== 'active') {
+    // Allow both 'active' and 'pending_verification'.
+    if (user.status !== 'active' && user.status !== 'pending_verification') {
       throw new UnauthorizedError('Account not active');
     }
 
@@ -517,7 +445,6 @@ export class AuthService {
 
   /**
    * Retry virtual account provisioning for existing users
-   * Admin utility to provision virtual accounts for users who missed it
    */
   static async retryVirtualAccountProvisioning(
     userId: string,
@@ -611,7 +538,6 @@ export class AuthService {
    */
   static async submitBVN(userId: string, bvn: string): Promise<{ success: boolean; message: string }> {
     try {
-      // Validate BVN format
       if (!this.validateBVN(bvn)) {
         return { success: false, message: 'Invalid BVN format. BVN must be 11 digits.' };
       }
@@ -641,7 +567,6 @@ export class AuthService {
    */
   static async submitNIN(userId: string, nin: string): Promise<{ success: boolean; message: string }> {
     try {
-      // Validate NIN format
       if (!this.validateNIN(nin)) {
         return { success: false, message: 'Invalid NIN format. NIN must be 11 digits.' };
       }
@@ -687,64 +612,66 @@ export class AuthService {
   }
 
   /**
-   * Get default split configuration from environment or database
+   * Derive onboarding state from existing data.
+   *
+   * Precedence:
+   *   1. `pending_verification` → awaiting_otp / verify_otp
+   *   2. passenger role         → passenger_kyc (until DVA active)
+   *   3. driver role            → driver_bank (until subaccount active)
+   *   4. admin/support/ops      → completed
+   *
+   * Phase 1 tasks are complete once the user has verified their OTP.
+   * Phase 2 tasks are tracked by downstream records
+   * (virtual_accounts for passengers, driver_profiles.subaccount_code
+   * for drivers). No schema change required.
    */
-  private static async getDefaultSplitConfig(): Promise<{ split_code?: string; subaccount?: string } | undefined> {
-    try {
-      // Check if default split is configured in database
-      const pool = (await import('../config/database')).default;
-      const result = await pool.query(
-        `SELECT value FROM platform_configuration 
-         WHERE key = 'default_dva_split_config' AND category = 'payment'`
-      );
-
-      if (result.rows.length > 0) {
-        const config = result.rows[0].value;
-        return typeof config === 'string' ? JSON.parse(config) : config;
-      }
-
-      // Fallback to environment variables
-      const splitCode = process.env.DEFAULT_DVA_SPLIT_CODE;
-      const subaccount = process.env.DEFAULT_DVA_SUBACCOUNT;
-
-      if (splitCode || subaccount) {
-        return { split_code: splitCode, subaccount };
-      }
-
-      return undefined;
-    } catch (error) {
-      logger.warn('Failed to get default split configuration:', error);
-      return undefined;
-    }
-  }
-
-  /**
-   * Get driver registration status (helper for frontend)
-   */
-  static async getDriverRegistrationStatus(userId: string): Promise<{
-    hasBankDetails: boolean;
-    hasSubaccount: boolean;
-    subaccountStatus: string | null;
-    isComplete: boolean;
-  }> {
-    const driver = await DriverModel.getByUserId(userId);
-    if (!driver) {
+  private static async getOnboardingState(
+    userId: string,
+    role: string,
+    status: string,
+    opts?: { subaccountStatus?: string }
+  ): Promise<IOnboardingState> {
+    // 1. Pending verification short-circuits everything else.
+    if (status === 'pending_verification') {
       return {
-        hasBankDetails: false,
-        hasSubaccount: false,
-        subaccountStatus: null,
-        isComplete: false,
+        phase: 'awaiting_otp',
+        next_step: 'verify_otp',
+        completed: false,
       };
     }
 
-    const hasBankDetails = !!(driver.bank_code && driver.account_number);
-    const hasSubaccount = !!(driver.subaccount_code && driver.subaccount_status === 'active');
+    // 2. Passenger Phase 2 = DVA provisioning
+    if (role === 'passenger') {
+      const pool = (await import('../config/database')).default;
+      const result = await pool.query(
+        `SELECT 1 FROM virtual_accounts WHERE user_id = $1 AND status = 'active' LIMIT 1`,
+        [userId]
+      );
+      const hasDVA = (result.rowCount ?? 0) > 0;
 
+      return {
+        phase: hasDVA ? 'completed' : 'role_onboarding',
+        next_step: hasDVA ? null : 'passenger_kyc',
+        completed: hasDVA,
+      };
+    }
+
+    // 3. Driver Phase 2 = subaccount creation
+    if (role === 'driver') {
+      const hasActiveSubaccount = opts?.subaccountStatus === 'active';
+
+      return {
+        phase: hasActiveSubaccount ? 'completed' : 'role_onboarding',
+        next_step: hasActiveSubaccount ? null : 'driver_bank',
+        completed: hasActiveSubaccount,
+      };
+    }
+
+    // 4. Admin / support / operations — nothing to onboard
     return {
-      hasBankDetails,
-      hasSubaccount,
-      subaccountStatus: driver.subaccount_status || null,
-      isComplete: hasBankDetails && hasSubaccount,
+      phase: 'completed',
+      next_step: null,
+      completed: true,
     };
   }
 }

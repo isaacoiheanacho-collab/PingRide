@@ -12,6 +12,25 @@ export const env = {
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:3001',
   mobileApiUrl: process.env.MOBILE_API_URL || 'http://localhost:4000/api/v1',
 
+  // ============================================
+  // MOCK / LIVE MODE CONTROL
+  // ============================================
+  // Controls whether external services (Paystack, etc.) use mock or real APIs.
+  // IMPORTANT: This is independent of NODE_ENV. You can run in development
+  // mode while hitting real Paystack APIs (useful for testing with live keys).
+  //
+  //   MOCK_PAYSTACK=true   → Use mock responses (no external API calls)
+  //   MOCK_PAYSTACK=false  → Use real Paystack API
+  //   MOCK_PAYSTACK unset  → Auto: mock if Paystack keys are missing
+  mockPaystack: (() => {
+    const value = process.env.MOCK_PAYSTACK;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    // Auto-fallback: mock if Paystack secret key is missing or invalid
+    const key = process.env.PAYSTACK_SECRET_KEY || '';
+    return !key || !key.startsWith('sk_');
+  })(),
+
   // Database
   dbHost: process.env.DB_HOST || 'localhost',
   dbPort: parseInt(process.env.DB_PORT || '5432', 10),
@@ -48,7 +67,6 @@ export const env = {
   cacheConfigTtl: parseInt(process.env.CACHE_CONFIG_TTL || '300', 10),
 
   // Business Rules
-  commissionRate: parseFloat(process.env.COMMISSION_RATE || '0.15'),
   biddingWindowSeconds: parseInt(process.env.BIDDING_WINDOW_SECONDS || '30', 10),
   driverConfirmationSeconds: parseInt(process.env.DRIVER_CONFIRMATION_SECONDS || '15', 10),
   cancellationFeePercentage: parseFloat(process.env.CANCELLATION_FEE_PERCENTAGE || '0.10'),
@@ -68,6 +86,16 @@ export const env = {
   paystackSecretKey: process.env.PAYSTACK_SECRET_KEY || '',
   paystackPublicKey: process.env.PAYSTACK_PUBLIC_KEY || '',
   paystackCallbackUrl: process.env.PAYSTACK_CALLBACK_URL || '',
+
+  // ============================================
+  // DOJAH (Phase 2C + 2D — Driver KYC & Vehicle Compliance)
+  // ============================================
+  // Sandbox base URL:    https://sandbox.dojah.io    (mock data, free)
+  // Production base URL: https://api.dojah.io        (live data, per-call billing)
+  // Auth uses two raw headers: Authorization: <secret_key> and AppId: <app_id>.
+  dojahAppId: process.env.DOJAH_APP_ID || '',
+  dojahPrivateKey: process.env.DOJAH_PRIVATE_KEY || '',
+  dojahBaseUrl: process.env.DOJAH_BASE_URL || 'https://sandbox.dojah.io',
 
   // Firebase
   firebaseProjectId: process.env.FIREBASE_PROJECT_ID || '',
@@ -98,15 +126,15 @@ export const env = {
   ddAppKey: process.env.DD_APP_KEY || '',
 
   // ============================================
-  // NEW: LICENSED PARTNER (Fintech/BaaS)
+  // LICENSED PARTNER (Fintech/BaaS)
   // ============================================
-  licensedPartner: process.env.LICENSED_PARTNER || 'providus',
+  licensedPartner: process.env.LICENSED_PARTNER || 'paystack',
   licensedPartnerApiKey: process.env.LICENSED_PARTNER_API_KEY || '',
   licensedPartnerBaseUrl: process.env.LICENSED_PARTNER_BASE_URL || '',
   licensedPartnerWebhookSecret: process.env.LICENSED_PARTNER_WEBHOOK_SECRET || '',
 
   // ============================================
-  // NEW: WALLET & REBATE CONFIGURATION
+  // WALLET & REBATE CONFIGURATION
   // ============================================
   defaultCommissionRate: parseFloat(process.env.DEFAULT_COMMISSION_RATE || '15') / 100,
   defaultRebateContributionRate: parseFloat(process.env.DEFAULT_REBATE_CONTRIBUTION_RATE || '1'),

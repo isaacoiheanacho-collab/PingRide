@@ -23,7 +23,10 @@ export class DriverModel {
 
   /**
    * Create driver profile
-   * Updated to include bank details for subaccount creation
+   *
+   * Phase 1: Creates a minimal profile (first_name + last_name only).
+   *          License / address / bank / emergency contact are optional and
+   *          are populated in later phases (2B bank, 3 identity + vehicle).
    */
   static async create(
     userId: string,
@@ -46,8 +49,8 @@ export class DriverModel {
       data.last_name,
       data.profile_photo_url || null,
       data.date_of_birth || null,
-      data.driver_license_number,
-      data.driver_license_expiry,
+      data.driver_license_number || null,
+      data.driver_license_expiry || null,
       'pending',
       'offline',
       'pending',
@@ -257,7 +260,7 @@ export class DriverModel {
   }
 
   // ============================================
-  // SUBACCOUNT MANAGEMENT METHODS (NEW)
+  // SUBACCOUNT MANAGEMENT METHODS
   // ============================================
 
   /**
@@ -449,7 +452,7 @@ export class DriverModel {
   }
 
   // ============================================
-  // POSTGIS GEOGRAPHIC QUERIES (UPDATED)
+  // POSTGIS GEOGRAPHIC QUERIES
   // ============================================
 
   /**

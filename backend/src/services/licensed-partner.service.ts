@@ -10,31 +10,32 @@ import logger from '../utils/logger';
 
 /**
  * Licensed Partner Integration Service
- * 
+ *
  * Supports Paystack Dedicated Virtual Accounts (DVAs) as the primary provider.
  * Paystack partners with Wema Bank and Titan Trust to provide static NUBAN accounts.
- * 
- * Flow:
- * 1. POST /customer - Create customer profile
- * 2. POST /identification - KYC verification (BVN/NIN - required for production)
- * 3. POST /dedicated_account - Generate static DVA
- * 4. Webhook: charge.success - Listen for incoming bank transfers
+ *
+ * Flow (issuance, NOT activation):
+ * 1. POST /customer                          — create customer profile
+ * 2. POST /customer/{code}/identification    — submit KYC (async, 202 Accepted)
+ * 3. POST /dedicated_account                 — issue DVA number (sync)
+ *
+ * The DVA number is returned immediately. KYC validation runs in the
+ * background and transitions the customer to `identified: true` when
+ * NIBSS confirms the identity.
  */
 export class LicensedPartnerService {
     private static apiClient: AxiosInstance | null = null;
     private static readonly PROVIDER = 'paystack';
-    
-    // Use Paystack secret key from env
+
     private static get API_KEY(): string {
         return env.paystackSecretKey || '';
     }
-    
+
     private static get BASE_URL(): string {
         return 'https://api.paystack.co';
     }
-    
+
     private static readonly WEBHOOK_SECRET = env.paystackSecretKey || '';
-    private static readonly IS_DEVELOPMENT = env.nodeEnv === 'development';
     private static readonly REQUEST_TIMEOUT = 30000;
 
     private static getClient(): AxiosInstance {
@@ -43,7 +44,7 @@ export class LicensedPartnerService {
             if (!apiKey) {
                 logger.warn('Paystack API key not configured. Please set PAYSTACK_SECRET_KEY in .env');
             }
-            
+
             this.apiClient = axios.create({
                 baseURL: this.BASE_URL,
                 headers: {
@@ -91,8 +92,15 @@ export class LicensedPartnerService {
         return this.BASE_URL;
     }
 
+    /**
+     * Mock mode is used ONLY when Paystack is not configured at all
+     * (missing or invalid secret key). NODE_ENV is NOT a factor — we
+     * always hit Paystack with whatever key is configured, including
+     * `sk_test_...` keys. Paystack's test mode is a Paystack concern,
+     * not an application-environment concern.
+     */
     private static shouldUseMock(): boolean {
-        return !this.isConfigured() || this.IS_DEVELOPMENT;
+        return !this.isConfigured();
     }
 
     private static generateMockAccountNumber(reference: string): string {
@@ -115,7 +123,7 @@ export class LicensedPartnerService {
             metadata: {
                 ...data.metadata,
                 _mock: true,
-                _note: 'This is a mock account for development only',
+                _note: 'Paystack not configured — mock account returned',
                 _created_at: new Date().toISOString(),
             },
         };
@@ -127,12 +135,12 @@ export class LicensedPartnerService {
 
     /**
      * Create a Paystack Dedicated Virtual Account (DVA) for a passenger
-     * 
+     *
      * Flow:
-     * 1. Create customer on Paystack
-     * 2. (Optional) Submit KYC identification (BVN/NIN)
-     * 3. Generate dedicated virtual account
-     * 
+     * 1. Create customer on Paystack                    → customer_code
+     * 2. Submit KYC identification (BVN + bank account) → 202 Accepted (async)
+     * 3. Issue dedicated virtual account                → DVA number (sync)
+     *
      * @param data - Account creation data including customer details
      * @returns Virtual account response with account number and bank details
      */
@@ -141,19 +149,20 @@ export class LicensedPartnerService {
         accountReference: string;
         metadata?: Record<string, any>;
     }): Promise<IVirtualAccountResponse> {
-        // Development mode: return mock data
+        // Mock only when Paystack isn't configured
         if (this.shouldUseMock()) {
-            logger.info('Using mock virtual account creation (Paystack DVA test mode)', {
+            logger.warn('Paystack not configured — returning mock DVA', {
                 accountName: data.accountName,
                 reference: data.accountReference,
             });
             return this.generateMockVirtualAccountResponse(data);
         }
 
-        try {
-            const client = this.getClient();
-            const metadata = data.metadata || {};
+        const client = this.getClient();
+        const metadata = data.metadata || {};
+        const preferredBank = metadata.preferred_bank || 'wema-bank';
 
+        try {
             // ============================================
             // STEP 1: Create Customer on Paystack
             // ============================================
@@ -163,10 +172,10 @@ export class LicensedPartnerService {
             });
 
             const customerResponse = await client.post('/customer', {
-                email: metadata.email || 'customer@pingride.com',
-                first_name: data.accountName.split(' ')[0] || 'PingRide',
-                last_name: data.accountName.split(' ').slice(1).join(' ') || 'User',
-                phone: metadata.phoneNumber || '08000000000',
+                email: metadata.email,
+                first_name: metadata.firstName || data.accountName.split(' ')[0] || 'PingRide',
+                last_name: metadata.lastName || data.accountName.split(' ').slice(1).join(' ') || 'User',
+                phone: metadata.phoneNumber,
                 metadata: {
                     pingride_user_id: metadata.userId,
                     pingride_user_type: metadata.userType || 'passenger',
@@ -183,45 +192,71 @@ export class LicensedPartnerService {
             logger.info(`Paystack customer created: ${customerCode}`);
 
             // ============================================
-            // STEP 2: KYC Verification (Optional - Required for Production)
+            // STEP 2: Submit KYC Identification (async)
             // ============================================
-            // Skip KYC in test mode - Paystack test mode bypasses KYC
-            if (!this.IS_DEVELOPMENT) {
-                // If BVN or NIN is provided, submit for verification
-                if (metadata.bvn || metadata.nin) {
-                    try {
-                        logger.info('Submitting KYC verification...');
-                        
-                        const identificationData: any = {
-                            country: 'NG',
-                            type: metadata.bvn ? 'bvn' : 'nin',
-                            value: metadata.bvn || metadata.nin,
-                        };
-                        
-                        await client.post(
-                            `/customer/${customerCode}/identification`,
-                            identificationData
-                        );
-                        logger.info('KYC verification submitted successfully');
-                    } catch (kycError) {
-                        // Don't fail DVA creation if KYC fails - can be retried later
-                        logger.warn('KYC verification failed (will retry later):', kycError);
+            // Paystack returns 202 Accepted. Validation happens in background.
+            // The DVA is issued regardless of this step's completion — KYC
+            // gating happens on Paystack's side, not ours.
+            if (metadata.bvn && metadata.bank_account_number && metadata.bank_code) {
+                try {
+                    logger.info('Submitting bank account identification...');
+
+                    const identificationPayload = {
+                        country: 'NG',
+                        type: 'bank_account',
+                        bvn: metadata.bvn,
+                        bank_code: metadata.bank_code,
+                        account_number: metadata.bank_account_number,
+                        first_name: metadata.firstName,
+                        last_name: metadata.lastName,
+                    };
+
+                    const identResponse = await client.post(
+                        `/customer/${customerCode}/identification`,
+                        identificationPayload
+                    );
+
+                    // 202 Accepted is success here
+                    if (identResponse.status === 202 || identResponse.data.status === true) {
+                        logger.info('KYC identification submitted (async processing started)', {
+                            customerCode,
+                            message: identResponse.data.message,
+                        });
+                    } else {
+                        logger.warn('KYC identification returned unexpected response', {
+                            customerCode,
+                            status: identResponse.status,
+                            body: identResponse.data,
+                        });
                     }
-                } else {
-                    logger.warn('No BVN/NIN provided. KYC verification skipped. DVA may not be issued in production.');
+                } catch (kycError) {
+                    // Don't fail DVA issuance if KYC submission fails — the
+                    // customer is created and DVA is issued; KYC can be retried.
+                    logger.warn('KYC identification submission failed (DVA will still be issued)', {
+                        customerCode,
+                        error: kycError instanceof Error ? kycError.message : 'Unknown error',
+                    });
                 }
             } else {
-                logger.info('Test mode: KYC verification skipped');
+                logger.warn('BVN / bank details not provided — DVA issued without KYC submission', {
+                    customerCode,
+                    has_bvn: !!metadata.bvn,
+                    has_bank_account: !!metadata.bank_account_number,
+                    has_bank_code: !!metadata.bank_code,
+                });
             }
 
             // ============================================
-            // STEP 3: Generate Dedicated Virtual Account
+            // STEP 3: Issue Dedicated Virtual Account
             // ============================================
-            logger.info('Generating Dedicated Virtual Account (DVA)...');
+            logger.info('Issuing Dedicated Virtual Account...', {
+                customerCode,
+                preferred_bank: preferredBank,
+            });
 
             const dvaResponse = await client.post('/dedicated_account', {
                 customer: customerCode,
-                preferred_bank: this.IS_DEVELOPMENT ? 'test-bank' : 'wema-bank',
+                preferred_bank: preferredBank,
             });
 
             if (dvaResponse.data.status !== true) {
@@ -230,34 +265,39 @@ export class LicensedPartnerService {
 
             const dvaData = dvaResponse.data.data;
 
-            logger.info('DVA created successfully', {
+            logger.info('DVA issued successfully', {
                 accountNumber: dvaData.account_number,
-                bankName: dvaData.bank.name,
+                bankName: dvaData.bank?.name,
                 accountName: dvaData.account_name,
+                assigned: dvaData.assigned,
+                active: dvaData.active,
             });
 
             return {
                 provider: 'paystack',
-                accountId: dvaData.id,
+                accountId: String(dvaData.id),
                 accountNumber: dvaData.account_number,
-                bankName: dvaData.bank.name,
+                bankName: dvaData.bank?.name || 'Wema Bank',
                 accountName: dvaData.account_name || data.accountName,
                 metadata: {
                     customer_code: customerCode,
                     customer_id: customerId,
-                    bank_id: dvaData.bank.id,
-                    bank_slug: dvaData.bank.slug,
-                    assigned_at: dvaData.created_at,
-                    ...dvaData,
+                    bank_id: dvaData.bank?.id,
+                    bank_slug: dvaData.bank?.slug,
+                    assigned: dvaData.assigned,
+                    active: dvaData.active,
+                    currency: dvaData.currency,
+                    assigned_at: dvaData.assignment?.assigned_at,
+                    raw: dvaData,
                 },
             };
         } catch (error) {
-            logger.error('Failed to create Paystack virtual account:', error);
-            
-            // Fallback to mock for development
-            if (this.shouldUseMock()) {
-                return this.generateMockVirtualAccountResponse(data);
-            }
+            const msg = error instanceof Error ? error.message : 'Unknown error';
+            logger.error('Failed to create Paystack virtual account:', {
+                error: msg,
+                accountName: data.accountName,
+                accountReference: data.accountReference,
+            });
             throw error;
         }
     }
@@ -275,16 +315,9 @@ export class LicensedPartnerService {
         payload: Record<string, any>,
         headers: Record<string, any>
     ): Promise<boolean> {
-        // Only support Paystack
         if (provider !== 'paystack') {
             logger.warn(`Unsupported provider for webhook verification: ${provider}`);
             return false;
-        }
-
-        // Development mode: bypass verification
-        if (this.IS_DEVELOPMENT) {
-            logger.debug('Webhook signature verification bypassed (development mode)');
-            return true;
         }
 
         return this.verifyPaystackSignature(payload, headers);
@@ -359,7 +392,6 @@ export class LicensedPartnerService {
         try {
             const client = this.getClient();
 
-            // Step 1: Create transfer recipient
             logger.info('Creating transfer recipient...', {
                 accountNumber: data.accountNumber,
                 bankCode: data.bankCode,
@@ -382,7 +414,6 @@ export class LicensedPartnerService {
 
             const recipientCode = recipientResponse.data.data.recipient_code;
 
-            // Step 2: Initiate transfer
             logger.info('Initiating transfer...', {
                 recipient: recipientCode,
                 amount: data.amount,
@@ -391,7 +422,7 @@ export class LicensedPartnerService {
 
             const transferResponse = await client.post('/transfer', {
                 source: 'balance',
-                amount: Math.round(data.amount * 100), // Convert to kobo
+                amount: Math.round(data.amount * 100),
                 recipient: recipientCode,
                 reason: data.narration || `PingRide driver payout - ${data.driverId}`,
                 reference: data.reference,
@@ -464,7 +495,7 @@ export class LicensedPartnerService {
 
             return {
                 status: data.status || 'unknown',
-                amount: data.amount ? data.amount / 100 : 0, // Convert from kobo
+                amount: data.amount ? data.amount / 100 : 0,
                 reference: data.reference || transactionId,
                 completedAt: data.updated_at || data.created_at,
                 error: data.failure_reason,
@@ -495,11 +526,10 @@ export class LicensedPartnerService {
             }
 
             const balances = response.data.data || [];
-            // Get the first balance (NGN)
             const ngnBalance = balances.find((b: any) => b.currency === 'NGN');
 
             return {
-                balance: ngnBalance ? ngnBalance.balance / 100 : 0, // Convert from kobo
+                balance: ngnBalance ? ngnBalance.balance / 100 : 0,
                 currency: 'NGN',
             };
         } catch (error) {

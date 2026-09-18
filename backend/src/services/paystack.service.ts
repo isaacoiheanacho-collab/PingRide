@@ -201,15 +201,25 @@ export class PaystackService {
   }
 
   /**
-   * Submit KYC identification (BVN/NIN)
-   * Required for DVA creation in production
+   * Submit KYC identification to Paystack
+   *
+   * Supports two shapes:
+   *   - type: 'bank_account' — required for DVA issuance. Requires BVN +
+   *     bank_code + account_number. Paystack validates with NIBSS asynchronously
+   *     and returns 202 Accepted.
+   *   - type: 'bvn' | 'nin' — legacy direct-value submissions (kept for
+   *     compatibility).
    */
   static async submitIdentification(
     customerCode: string,
     data: {
-      country: string;
-      type: 'bvn' | 'nin' | 'identity_number';
-      value: string;
+      country?: string;
+      type: 'bank_account' | 'bvn' | 'nin' | 'identity_number';
+      value?: string;
+      // For bank_account submissions:
+      bvn?: string;
+      bank_code?: string;
+      account_number?: string;
       first_name?: string;
       last_name?: string;
     }
@@ -218,8 +228,23 @@ export class PaystackService {
       const payload: any = {
         country: data.country || 'NG',
         type: data.type,
-        value: data.value,
       };
+
+      if (data.type === 'bank_account') {
+        if (!data.bvn || !data.bank_code || !data.account_number) {
+          throw new Error(
+            'bank_account identification requires bvn, bank_code, and account_number'
+          );
+        }
+        payload.bvn = data.bvn;
+        payload.bank_code = data.bank_code;
+        payload.account_number = data.account_number;
+      } else {
+        if (!data.value) {
+          throw new Error(`type '${data.type}' requires a 'value' field`);
+        }
+        payload.value = data.value;
+      }
 
       if (data.first_name) payload.first_name = data.first_name;
       if (data.last_name) payload.last_name = data.last_name;
@@ -229,19 +254,61 @@ export class PaystackService {
         payload,
         {
           headers: this.getHeaders(),
+          // Paystack returns 202 Accepted for async identification — treat
+          // it as success, not an error.
+          validateStatus: (status) => status < 500,
         }
       );
 
-      if (response.data.status) {
-        logger.info(`KYC identification submitted for customer: ${customerCode}`);
+      // 202 Accepted or 200 OK both indicate the submission was accepted.
+      const ok =
+        response.status === 202 ||
+        response.status === 200 ||
+        response.data?.status === true;
+
+      if (ok) {
+        logger.info(
+          `KYC identification submitted for customer ${customerCode} (status ${response.status})`
+        );
         return response.data;
-      } else {
-        throw new Error(response.data.message || 'Failed to submit identification');
       }
+
+      throw new Error(
+        response.data?.message || `Failed to submit identification (status ${response.status})`
+      );
     } catch (error) {
-      logger.error('Paystack identification error:', error);
+      logger.error('Paystack identification error:', {
+        customerCode,
+        type: data.type,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
       throw error;
     }
+  }
+
+  /**
+   * Convenience wrapper: submit bank-account identification (BVN + account)
+   * for DVA issuance.
+   */
+  static async submitBankAccountIdentification(
+    customerCode: string,
+    data: {
+      bvn: string;
+      bankCode: string;
+      accountNumber: string;
+      firstName?: string;
+      lastName?: string;
+    }
+  ): Promise<any> {
+    return this.submitIdentification(customerCode, {
+      country: 'NG',
+      type: 'bank_account',
+      bvn: data.bvn,
+      bank_code: data.bankCode,
+      account_number: data.accountNumber,
+      first_name: data.firstName,
+      last_name: data.lastName,
+    });
   }
 
   // ============================================

@@ -12,13 +12,25 @@ export type PaymentType = 'ride' | 'top_up' | 'withdrawal' | 'refund';
 
 export type WalletStatus = 'active' | 'frozen' | 'closed';
 
-export type WalletTransactionType = 'top_up' | 'payment' | 'refund' | 'commission' | 'withdrawal' | 'adjustment' | 'bonus';
+export type WalletTransactionType =
+  | 'top_up'
+  | 'topup'
+  | 'deposit'
+  | 'payment'
+  | 'payout'
+  | 'withdrawal'
+  | 'refund'
+  | 'bonus'
+  | 'commission'
+  | 'adjustment'
+  | 'rebate_credit'
+  | 'rebate_usage'
+  | 'promotion'
+  | 'driver_earnings';
+
 export type WalletTransactionStatus = 'pending' | 'completed' | 'failed' | 'reversed';
 
 export type RefundStatus = 'pending' | 'processed' | 'failed';
-
-export type SettlementStatus = 'pending' | 'processing' | 'completed' | 'failed';
-export type PayoutMethod = 'bank_transfer' | 'mobile_money' | 'wallet';
 
 export type WithdrawalStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
 export type WithdrawalMethod = 'bank_transfer' | 'mobile_money' | 'cash';
@@ -150,7 +162,7 @@ export interface IWallet {
     virtual_account_bank: string | null;
     virtual_account_name: string | null;
     // ============================================
-    // NEW: SPLIT BALANCE FIELDS (V2.0)
+    // SPLIT BALANCE FIELDS (V2.0)
     // ============================================
     deposited_balance: number;        // Customer-funded, withdrawable
     rebate_credit_balance: number;    // PingRide-issued, non-withdrawable
@@ -197,44 +209,6 @@ export interface ICreateWalletTransaction {
     reference_id?: string;
     description: string;
     metadata?: any;
-}
-
-// ============================================
-// SETTLEMENT INTERFACES
-// ============================================
-
-export interface ISettlement {
-    id: string;
-    driver_id: string;
-    period_start: string;
-    period_end: string;
-    total_earnings: number;
-    total_commission: number;
-    net_payout: number;
-    payout_method: PayoutMethod;
-    status: SettlementStatus;
-    reference: string | null;
-    processed_at: Date | null;
-    paid_at: Date | null;
-    created_at: Date;
-    updated_at: Date;
-}
-
-export interface ICreateSettlement {
-    driver_id: string;
-    period_start: string;
-    period_end: string;
-    total_earnings: number;
-    total_commission: number;
-    net_payout: number;
-    payout_method: PayoutMethod;
-}
-
-export interface IUpdateSettlement {
-    status?: SettlementStatus;
-    reference?: string;
-    processed_at?: Date;
-    paid_at?: Date;
 }
 
 // ============================================
@@ -370,9 +344,9 @@ export interface IPaystackInitTransaction {
     callback_url?: string;
     metadata?: any;
     // ============================================
-    // NEW: SPLIT SUPPORT
+    // SPLIT SUPPORT
     // ============================================
-    split?: ISplitConfig;  // ✅ Added split support for Paystack transactions
+    split?: ISplitConfig;
 }
 
 export interface IPaystackInitResponse {
@@ -446,11 +420,6 @@ export interface ITransactionResponse {
     limit: number;
 }
 
-export interface ISettlementResponse {
-    settlement: ISettlement;
-    driver_ledger: IDriverLedger;
-}
-
 export interface IWithdrawalResponse {
     withdrawal: IWithdrawal;
     remaining_balance: number;
@@ -462,6 +431,8 @@ export interface IWithdrawalResponse {
 
 export interface IInitializePaymentRequest {
     ride_id: string;
+    passenger_id: string;
+    amount: number;
     payment_method: PaymentMethod;
     email?: string;
 }
@@ -487,18 +458,8 @@ export interface IRefundRequest {
     reason: string;
 }
 
-// Duplicate IInitializePaymentRequest with additional fields
-// Note: This appears to be intentional in the original file
-export interface IInitializePaymentRequest {
-    ride_id: string;
-    passenger_id: string;
-    amount: number;
-    payment_method: PaymentMethod;
-    email?: string;
-}
-
 // ============================================
-// PASSENGER PROFILE INTERFACE (ADDED)
+// PASSENGER PROFILE INTERFACE
 // ============================================
 
 export interface IPassengerProfile {
@@ -517,18 +478,18 @@ export interface IPassengerProfile {
     updated_at: Date;
     virtual_account_id?: string;
     // ============================================
-    // NEW: KYC FIELDS (V2.0)
+    // KYC FIELDS (V2.0)
     // ============================================
-    bvn?: string;                         // BVN for KYC verification
-    nin?: string;                         // NIN for KYC verification
-    kyc_status: 'pending' | 'verified' | 'failed';  // KYC status
-    kyc_verified_at?: Date;               // When KYC was verified
-    kyc_verified_by?: string;             // Admin who verified
-    kyc_failure_reason?: string;          // Why KYC failed
+    bvn?: string;
+    nin?: string;
+    kyc_status: 'pending' | 'verified' | 'failed';
+    kyc_verified_at?: Date;
+    kyc_verified_by?: string;
+    kyc_failure_reason?: string;
 }
 
 // ============================================
-// VIRTUAL ACCOUNT TYPES (ADDED)
+// VIRTUAL ACCOUNT TYPES
 // ============================================
 
 export interface IVirtualAccount {
@@ -576,7 +537,7 @@ export interface IBankTransferEvent {
     idempotency_key?: string;
     credited_to_wallet: boolean;
     wallet_transaction_id?: string;
-    metadata?: any;  // For storing split information and additional webhook data
+    metadata?: any;
     created_at: Date;
     updated_at: Date;
 }
@@ -592,7 +553,7 @@ export interface ICreateBankTransferEvent {
     narration?: string;
     idempotencyKey?: string;
     status?: string;
-    metadata?: any;  // For storing additional data during creation
+    metadata?: any;
 }
 
 export interface IProviderTransaction {
@@ -663,7 +624,7 @@ export interface ICreateUnmatchedTransfer {
 }
 
 // ============================================
-// NEW: SPLIT PAYMENT INTERFACES (Task 1)
+// SPLIT PAYMENT INTERFACES
 // ============================================
 
 /**

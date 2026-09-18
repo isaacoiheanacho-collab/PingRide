@@ -21,7 +21,7 @@ export interface IUser {
 }
 
 // ============================================
-// AUTH TYPES (UPDATED WITH DRIVER FIELDS)
+// AUTH TYPES
 // ============================================
 
 export interface IJWTPayload {
@@ -46,39 +46,89 @@ export interface ILoginRequest {
   device_type?: 'ios' | 'android' | 'web';
 }
 
+// ============================================
+// PHASE 1 — GENERAL REGISTRATION
+// Only: first_name, last_name, phone_number, password, user_type
+// ============================================
+
 export interface IRegisterRequest {
-  phone_number: string;
-  email?: string;
-  password: string;
   first_name: string;
   last_name: string;
+  phone_number: string;
+  password: string;
   user_type: 'passenger' | 'driver';
-  // ============================================
-  // KYC FIELDS
-  // ============================================
-  profile_photo_url?: string;      // Passport photo or profile picture
-  date_of_birth?: string;          // Date of birth (YYYY-MM-DD)
-  gender?: 'male' | 'female' | 'other' | 'prefer_not_to_say';
-  bvn?: string;                    // Bank Verification Number (for KYC)
-  nin?: string;                    // National Identification Number (for KYC)
-  // ============================================
-  // DRIVER-SPECIFIC FIELDS (for driver registration)
-  // ============================================
-  driver_license_number?: string;  // Driver's license number
-  driver_license_expiry?: string;  // Driver's license expiry date
-  address?: string;                // Driver's address
-  state_of_origin?: string;        // Driver's state of origin
-  emergency_contact_name?: string; // Emergency contact name
-  emergency_contact_phone?: string;// Emergency contact phone
-  has_air_conditioning?: boolean;  // Vehicle has AC
-  has_working_stereo?: boolean;    // Vehicle has working stereo
-  interior_air_freshener?: boolean;// Vehicle has air freshener
-  // ============================================
-  // BANK DETAILS (for driver subaccount creation)
-  // ============================================
-  bank_code?: string;              // Bank code (e.g., 058 for GTBank)
-  account_number?: string;         // Driver's bank account number
 }
+
+// ============================================
+// ONBOARDING STATE (Phase 1 auth responses)
+// Phase 1 → awaiting_otp → (OTP verified) → role_onboarding → (Phase 2 complete) → completed
+// ============================================
+
+export type OnboardingPhase = 'awaiting_otp' | 'role_onboarding' | 'completed';
+
+export type OnboardingNextStep =
+  | 'verify_otp'
+  | 'passenger_kyc'
+  | 'driver_bank'
+  | 'driver_identity'
+  | 'driver_vehicle'
+  | null;
+
+export interface IOnboardingState {
+  phase: OnboardingPhase;
+  next_step: OnboardingNextStep;
+  completed: boolean;
+}
+
+// ============================================
+// ONBOARDING REQUEST / STATUS TYPES (Phase 2)
+// ============================================
+
+/**
+ * Phase 2A — Passenger BVN + bank submission for DVA issuance.
+ *
+ * Sent to POST /api/v1/onboarding/passenger/kyc.
+ * Paystack uses these to build the customer record, submit NIBSS
+ * identification, and issue a Dedicated Virtual Account (Wema Bank).
+ */
+export interface IPassengerOnboardingRequest {
+  email: string;
+  bvn: string;
+  bank_account_number: string;
+  bank_code: string;
+  bank_name: string;
+}
+
+/**
+ * Phase 2B — Driver bank / subaccount submission.
+ */
+export interface IDriverOnboardingRequest {
+  email: string;
+  settlement_bank_name: string;
+  settlement_bank_code: string;
+  settlement_account_number: string;
+}
+
+/**
+ * Response shape for GET /api/v1/onboarding/status
+ * Derives the user's current state from existing records (no schema change).
+ */
+export interface IOnboardingStatusResponse {
+  role: 'passenger' | 'driver';
+  phase: 'role_onboarding' | 'completed';
+  next_step:
+    | 'passenger_kyc'
+    | 'driver_bank'
+    | 'driver_identity'
+    | 'driver_vehicle'
+    | null;
+  completed: boolean;
+  details?: Record<string, unknown>;
+}
+
+// ============================================
+// OTP / PASSWORD / TOKEN TYPES
+// ============================================
 
 export interface IVerifyOTPRequest {
   phone_number: string;
@@ -105,6 +155,12 @@ export interface IResetPasswordConfirmRequest {
   new_password: string;
 }
 
+// ============================================
+// AUTH RESPONSE
+// tokens are only present after OTP verification
+// onboarding is always present so the client knows what to do next
+// ============================================
+
 export interface IAuthResponse {
   user: {
     id: string;
@@ -115,7 +171,8 @@ export interface IAuthResponse {
     role: string;
     status: string;
   };
-  tokens: ITokens;
+  tokens?: ITokens;
+  onboarding: IOnboardingState;
 }
 
 // ============================================
@@ -138,14 +195,14 @@ export interface IPassengerProfile {
   updated_at: Date;
   virtual_account_id?: string;
   // ============================================
-  // NEW: KYC FIELDS (V2.0)
+  // KYC FIELDS (V2.0)
   // ============================================
-  bvn?: string;                         // BVN for KYC verification
-  nin?: string;                         // NIN for KYC verification
-  kyc_status: 'pending' | 'verified' | 'failed';  // KYC status
-  kyc_verified_at?: Date;               // When KYC was verified
-  kyc_verified_by?: string;             // Admin who verified
-  kyc_failure_reason?: string;          // Why KYC failed
+  bvn?: string;
+  nin?: string;
+  kyc_status: 'pending' | 'verified' | 'failed';
+  kyc_verified_at?: Date;
+  kyc_verified_by?: string;
+  kyc_failure_reason?: string;
 }
 
 export interface ISavedLocation {
@@ -208,7 +265,7 @@ export interface IDriverProfile {
   first_name: string;
   last_name: string;
   profile_photo_url?: string;
-  date_of_birth?: string;
+  date_of_birth?: string | Date;
   driver_license_number?: string;
   driver_license_expiry?: string;
   driver_status: 'pending' | 'under_review' | 'approved' | 'active' | 'suspended' | 'rejected' | 'deactivated';
@@ -245,14 +302,45 @@ export interface IDriverProfile {
   created_at: Date;
   updated_at: Date;
   // ============================================
-  // NEW: SUBACCOUNT FIELDS (Phase 5)
+  // SUBACCOUNT FIELDS (Phase 2B)
   // ============================================
-  subaccount_code?: string;                 // Paystack subaccount code (ACCT_xxxxxxxxxx)
-  bank_code?: string;                       // Bank code (e.g., 058 for GTBank)
-  account_number?: string;                  // Driver's bank account number
-  account_name?: string;                    // Driver's account name (verified from Paystack)
-  subaccount_created_at?: Date;             // When subaccount was created
-  subaccount_status?: 'pending' | 'active' | 'failed';  // Subaccount status
+  subaccount_code?: string;
+  bank_code?: string;
+  account_number?: string;
+  account_name?: string;
+  subaccount_created_at?: Date;
+  subaccount_status?: 'pending' | 'active' | 'failed';
+
+  // ============================================
+  // IDENTITY KYC FIELDS (Phase 2C — manual review)
+  // ============================================
+  license_verified?: boolean;
+  license_verification_provider?: string | null;
+  license_verified_at?: Date | null;
+  license_expiry_date?: string | null;
+  license_photo_url?: string | null;
+  license_back_url?: string | null;
+  license_state_of_issue?: string | null;
+
+  nin?: string | null;
+  nin_id_card_url?: string | null;
+  nin_verified?: boolean;
+
+  bvn?: string | null;
+  bvn_verified?: boolean;
+
+  selfie_url?: string | null;
+
+  liveness_check_required?: boolean;
+  last_liveness_check_at?: Date | null;
+  liveness_check_failures?: number;
+
+  identity_fully_verified?: boolean;
+  identity_verified_at?: Date | null;
+  identity_submitted_at?: Date | null;
+  identity_reviewed_at?: Date | null;
+  identity_reviewed_by?: string | null;
+  identity_review_notes?: string | null;
 }
 
 export interface IVehicle {
@@ -275,6 +363,48 @@ export interface IVehicle {
   roadworthiness_expiry?: string;
   created_at: Date;
   updated_at: Date;
+
+  // ============================================
+  // VEHICLE COMPLIANCE KYC FIELDS (Phase 2D — manual review)
+  // ============================================
+  plate_verified?: boolean;
+  plate_verification_provider?: string | null;
+  plate_verified_at?: Date | null;
+  plate_owner_name?: string | null;
+  plate_owner_match?: boolean | null;
+  plate_vehicle_make?: string | null;
+  plate_vehicle_model?: string | null;
+  plate_vehicle_vin?: string | null;
+
+  poc_document_url?: string | null;
+  poc_verified?: boolean;
+
+  vehicle_license_url?: string | null;
+  vehicle_license_verified?: boolean;
+
+  roadworthiness_verified?: boolean;
+  roadworthiness_verified_at?: Date | null;
+  roadworthiness_verified_by?: string | null;
+
+  hackney_permit_url?: string | null;
+  hackney_permit_verified?: boolean;
+  hackney_permit_expiry?: string | null;
+  hackney_permit_verified_at?: Date | null;
+  hackney_permit_verified_by?: string | null;
+
+  insurance_verified?: boolean;
+  insurance_policy_number?: string | null;
+  insurance_provider?: string | null;
+  insurance_verification_method?: 'api' | 'manual' | null;
+  insurance_verified_at?: Date | null;
+  insurance_verified_by?: string | null;
+
+  compliance_fully_verified?: boolean;
+  compliance_verified_at?: Date | null;
+  compliance_submitted_at?: Date | null;
+  compliance_reviewed_at?: Date | null;
+  compliance_reviewed_by?: string | null;
+  compliance_notes?: string | null;
 }
 
 export interface IDriverDocument {
@@ -303,13 +433,17 @@ export interface IKYCVerification {
   updated_at: Date;
 }
 
+// ============================================
+// PHASE 1 DRIVER PROFILE CREATION
+// ============================================
+
 export interface ICreateDriverProfile {
   first_name: string;
   last_name: string;
   profile_photo_url?: string;
   date_of_birth?: string;
-  driver_license_number: string;
-  driver_license_expiry: string;
+  driver_license_number?: string;
+  driver_license_expiry?: string;
   address?: string;
   state_of_origin?: string;
   emergency_contact_name?: string;
@@ -317,11 +451,8 @@ export interface ICreateDriverProfile {
   has_air_conditioning?: boolean;
   has_working_stereo?: boolean;
   interior_air_freshener?: boolean;
-  // ============================================
-  // NEW: BANK DETAILS FOR SUBACCOUNT CREATION
-  // ============================================
-  bank_code?: string;                       // Bank code for subaccount
-  account_number?: string;                  // Account number for subaccount
+  bank_code?: string;
+  account_number?: string;
 }
 
 export interface ICreateVehicle {
@@ -355,9 +486,6 @@ export interface IUpdateDriverProfile {
   has_air_conditioning?: boolean;
   has_working_stereo?: boolean;
   interior_air_freshener?: boolean;
-  // ============================================
-  // NEW: BANK DETAILS UPDATE
-  // ============================================
   bank_code?: string;
   account_number?: string;
   account_name?: string;
@@ -504,10 +632,6 @@ export interface IBidRankingResult {
 // V2.0 INCENTIVE ECOSYSTEM TYPES
 // ============================================
 
-// ============================================
-// 1. Programme Period Types
-// ============================================
-
 export interface IProgrammePeriod {
   id: string;
   year: number;
@@ -544,10 +668,6 @@ export interface ICreateProgrammePeriod {
   status?: 'draft' | 'active' | 'closed' | 'archived';
   created_by?: string;
 }
-
-// ============================================
-// 2. Passenger Qualification Types
-// ============================================
 
 export type QualificationStatus = 'not_started' | 'in_progress' | 'qualified' | 'excluded';
 export type FraudReviewStatus = 'clean' | 'under_review' | 'excluded';
@@ -587,10 +707,6 @@ export interface IDriverQualification {
   created_at: Date;
   updated_at: Date;
 }
-
-// ============================================
-// 3. PINGRIDE Progress Types
-// ============================================
 
 export type PINGRIDELetterChar = 'P' | 'I' | 'N' | 'G' | 'R' | 'I' | 'D' | 'E';
 
@@ -641,10 +757,6 @@ export interface IDriverPINGRIDEProgress {
   created_at: Date;
   updated_at: Date;
 }
-
-// ============================================
-// 4. Rebate Fund Types
-// ============================================
 
 export interface IRebateFundBalance {
   id: string;
@@ -716,10 +828,6 @@ export interface IRebateCreditUsage {
   created_at: Date;
 }
 
-// ============================================
-// 5. Winner Types
-// ============================================
-
 export interface IWinner {
   id: string;
   user_id: string;
@@ -746,10 +854,6 @@ export interface IWinnerSelectionResult {
   winners: IWinner[];
   status: 'no_qualified' | 'all_selected' | 'selected_by_ranking';
 }
-
-// ============================================
-// 6. Driver Profit Pool Types
-// ============================================
 
 export interface IDriverProfitPool {
   id: string;
@@ -783,18 +887,14 @@ export interface IDriverProfitAllocation {
   updated_at: Date;
 }
 
-// ============================================
-// 7. Fraud Detection Types (UPDATED)
-// ============================================
-
-export type FraudCaseType = 
-    | 'collusion' 
-    | 'ghost_ride' 
-    | 'gps_spoofing' 
-    | 'payment_fraud' 
-    | 'account_abuse' 
-    | 'qualification_velocity'
-    | 'other';
+export type FraudCaseType =
+  | 'collusion'
+  | 'ghost_ride'
+  | 'gps_spoofing'
+  | 'payment_fraud'
+  | 'account_abuse'
+  | 'qualification_velocity'
+  | 'other';
 
 export type FraudSeverity = 'low' | 'medium' | 'high' | 'critical';
 export type FraudCaseStatus = 'detected' | 'investigating' | 'confirmed' | 'dismissed' | 'resolved';
@@ -840,10 +940,6 @@ export interface IFraudCase {
   updated_at: Date;
 }
 
-// ============================================
-// 8. Exclusion Types
-// ============================================
-
 export type ExclusionType = 'qualification_reversal' | 'winner_disqualification' | 'programme_ban' | 'temporary_suspension';
 
 export interface IQualificationExclusion {
@@ -861,10 +957,6 @@ export interface IQualificationExclusion {
   created_at: Date;
   updated_at: Date;
 }
-
-// ============================================
-// 9. Qualification Response Types
-// ============================================
 
 export interface IPassengerQualificationResponse {
   period: IProgrammePeriod | null;
@@ -885,10 +977,6 @@ export interface IDriverQualificationResponse {
   qualifyingContribution: number;
   remaining: number;
 }
-
-// ============================================
-// 10. Rebate Request/Response Types
-// ============================================
 
 export interface IRecordContributionRequest {
   rideId: string;
@@ -917,10 +1005,6 @@ export interface IRebateAllocationResponse {
   fundSufficiencyApplied: boolean;
 }
 
-// ============================================
-// 11. Winner Request/Response Types
-// ============================================
-
 export interface ISelectWinnersRequest {
   programmePeriodId: string;
   userType: 'passenger' | 'driver';
@@ -937,10 +1021,6 @@ export interface IWinnerSelectionResponse {
   winners: IWinner[];
   status: 'no_qualified' | 'all_selected' | 'selected_by_ranking';
 }
-
-// ============================================
-// 12. Fraud Detection Request/Response Types
-// ============================================
 
 export interface IDetectFraudRequest {
   userId: string;
@@ -964,6 +1044,140 @@ export interface IResolveFraudCaseRequest {
   status: 'confirmed' | 'dismissed' | 'resolved';
   resolutionNotes?: string;
   action?: 'exclude' | 'reverse_qualification' | 'disqualify_winner' | 'none';
+}
+
+// ============================================
+// PHASE 2C — DRIVER IDENTITY KYC TYPES (MANUAL REVIEW)
+// ============================================
+
+export interface IDriverIdentitySubmission {
+  license_number: string;
+  license_expiry_date: string;
+  license_front_url: string;
+  license_back_url: string;
+
+  nin: string;
+  nin_id_card_url: string;
+
+  bvn: string;
+
+  date_of_birth: string;
+
+  selfie_url: string;
+}
+
+export interface IDriverIdentityStatusResponse {
+  submission_status: 'not_submitted' | 'pending_admin_review' | 'approved' | 'rejected';
+  license_verified: boolean;
+  nin_verified: boolean;
+  bvn_verified: boolean;
+  identity_fully_verified: boolean;
+  needs_recheck: boolean;
+  rejection_reason?: string | null;
+  submitted_at?: string | null;
+  reviewed_at?: string | null;
+  next_step: 'driver_identity' | 'driver_vehicle' | 'completed' | null;
+}
+
+// ============================================
+// PHASE 2D — VEHICLE COMPLIANCE KYC TYPES (MANUAL REVIEW)
+// ============================================
+
+export interface IVehicleComplianceSubmission {
+  vehicle_id: string;
+  plate_number: string;
+
+  poc_document_url: string;
+  vehicle_license_url: string;
+  roadworthiness_document_url: string;
+  hackney_permit_url: string;
+  insurance_document_url: string;
+
+  insurance_policy_number: string;
+  insurance_provider?: string;
+  insurance_expiry?: string;
+}
+
+export interface IVehicleComplianceStatusResponse {
+  submission_status: 'not_submitted' | 'pending_admin_review' | 'approved' | 'rejected';
+  plate_verified: boolean;
+  poc_verified: boolean;
+  vehicle_license_verified: boolean;
+  roadworthiness_verified: boolean;
+  hackney_permit_verified: boolean;
+  insurance_verified: boolean;
+  compliance_fully_verified: boolean;
+  rejection_reason?: string | null;
+  submitted_at?: string | null;
+  reviewed_at?: string | null;
+  next_step: 'driver_identity' | 'driver_vehicle' | 'completed' | null;
+}
+
+export interface IIdentityReviewRequest {
+  decision: 'approve' | 'reject';
+  notes?: string;
+  license_verified?: boolean;
+  nin_verified?: boolean;
+  bvn_verified?: boolean;
+}
+
+export interface IVehicleDocumentReviewRequest {
+  document_type:
+    | 'poc'
+    | 'vehicle_license'
+    | 'roadworthiness'
+    | 'hackney_permit'
+    | 'insurance';
+  decision: 'approve' | 'reject';
+  notes?: string;
+}
+
+export interface IAdminReviewQueueItem {
+  driver_id: string;
+  driver_user_id: string;
+  first_name: string;
+  last_name: string;
+  phone_number: string;
+  email?: string;
+  submission_type: 'identity' | 'vehicle';
+  submitted_at: Date;
+  status: 'pending_admin_review' | 'approved' | 'rejected';
+  payload: Record<string, unknown>;
+}
+
+export interface IAdminReviewQueueResponse {
+  items: IAdminReviewQueueItem[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+// ============================================
+// CONSENT TYPES (NDPA)
+// ============================================
+
+export type ConsentType =
+  | 'terms_of_service'
+  | 'privacy_policy'
+  | 'kyc_data_sharing'
+  | 'liveness_capture';
+
+export interface IUserConsent {
+  id: string;
+  user_id: string;
+  consent_type: ConsentType;
+  consent_version: string;
+  granted: boolean;
+  ip_address?: string;
+  user_agent?: string;
+  metadata?: Record<string, unknown>;
+  created_at: Date;
+  revoked_at?: Date;
+}
+
+export interface IRecordConsentRequest {
+  consent_type: ConsentType;
+  consent_version: string;
 }
 
 // ============================================

@@ -46,18 +46,15 @@ export class WalletModel {
   }
 
   /**
-   * Update wallet
+   * Update wallet (status / freeze fields only)
+   * NOTE: balance writes must go through creditDeposited/debitDeposited
+   *       or creditRebate/debitRebate. This method no longer accepts
+   *       a 'balance' field — use updateDepositedBalance instead.
    */
   static async update(id: string, data: IUpdateWallet): Promise<IWallet | null> {
     const updates: string[] = [];
     const values: any[] = [];
     let paramCount = 1;
-
-    if (data.balance !== undefined) {
-      updates.push(`balance = $${paramCount}`);
-      values.push(data.balance);
-      paramCount++;
-    }
 
     if (data.status !== undefined) {
       updates.push(`status = $${paramCount}`);
@@ -91,20 +88,6 @@ export class WalletModel {
       RETURNING *
     `;
     const result = await pool.query(query, values);
-    return result.rows[0] || null;
-  }
-
-  /**
-   * Update wallet balance (with transaction)
-   */
-  static async updateBalance(id: string, newBalance: number): Promise<IWallet | null> {
-    const result = await pool.query(
-      `UPDATE wallets 
-       SET balance = $1, updated_at = NOW()
-       WHERE id = $2
-       RETURNING *`,
-      [newBalance, id]
-    );
     return result.rows[0] || null;
   }
 
@@ -370,8 +353,15 @@ export class WalletModel {
     };
   }
 
+  // ============================================
+  // LEGACY WRAPPERS (delegate to deposited funds)
+  // ============================================
+  // These keep old call sites working without
+  // touching the legacy `balance` column. All
+  // money now flows through deposited_balance.
+
   /**
-   * Credit wallet (add funds)
+   * Credit wallet (legacy wrapper — routes to deposited_balance)
    */
   static async credit(
     walletId: string,
@@ -381,73 +371,21 @@ export class WalletModel {
     referenceId?: string,
     metadata?: any
   ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const walletResult = await client.query(
-        'SELECT * FROM wallets WHERE id = $1 FOR UPDATE',
-        [walletId]
-      );
-
-      if (walletResult.rows.length === 0) {
-        throw new Error('Wallet not found');
-      }
-
-      const wallet = walletResult.rows[0];
-      const newBalance = parseFloat(wallet.balance) + amount;
-
-      const updatedWalletResult = await client.query(
-        'UPDATE wallets SET balance = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
-        [newBalance, walletId]
-      );
-
-      const transactionResult = await client.query(
-        `INSERT INTO wallet_transactions (
-          wallet_id,
-          transaction_type,
-          amount,
-          balance_before,
-          balance_after,
-          reference_type,
-          reference_id,
-          description,
-          status,
-          metadata,
-          completed_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-        RETURNING *`,
-        [
-          walletId,
-          'top_up',
-          amount,
-          wallet.balance,
-          newBalance,
-          referenceType || 'topup',
-          referenceId || null,
-          description,
-          'completed',
-          metadata || null,
-        ]
-      );
-
-      await client.query('COMMIT');
-
-      logger.info(`Wallet credited: ${walletId}, amount: ${amount}`);
-      return {
-        wallet: updatedWalletResult.rows[0],
-        transaction: transactionResult.rows[0],
-      };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    logger.debug(
+      `WalletModel.credit() called for ${walletId}; delegating to creditDeposited()`
+    );
+    return this.creditDeposited(
+      walletId,
+      amount,
+      description,
+      referenceType,
+      referenceId,
+      metadata
+    );
   }
 
   /**
-   * Debit wallet (deduct funds)
+   * Debit wallet (legacy wrapper — routes to deposited_balance)
    */
   static async debit(
     walletId: string,
@@ -457,79 +395,21 @@ export class WalletModel {
     referenceId?: string,
     metadata?: any
   ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const walletResult = await client.query(
-        'SELECT * FROM wallets WHERE id = $1 FOR UPDATE',
-        [walletId]
-      );
-
-      if (walletResult.rows.length === 0) {
-        throw new Error('Wallet not found');
-      }
-
-      const wallet = walletResult.rows[0];
-      const currentBalance = parseFloat(wallet.balance);
-
-      if (currentBalance < amount) {
-        throw new Error('Insufficient wallet balance');
-      }
-
-      const newBalance = currentBalance - amount;
-
-      const updatedWalletResult = await client.query(
-        'UPDATE wallets SET balance = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
-        [newBalance, walletId]
-      );
-
-      const transactionResult = await client.query(
-        `INSERT INTO wallet_transactions (
-          wallet_id,
-          transaction_type,
-          amount,
-          balance_before,
-          balance_after,
-          reference_type,
-          reference_id,
-          description,
-          status,
-          metadata,
-          completed_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-        RETURNING *`,
-        [
-          walletId,
-          'payment',
-          amount,
-          currentBalance,
-          newBalance,
-          referenceType || 'ride',
-          referenceId || null,
-          description,
-          'completed',
-          metadata || null,
-        ]
-      );
-
-      await client.query('COMMIT');
-
-      logger.info(`Wallet debited: ${walletId}, amount: ${amount}`);
-      return {
-        wallet: updatedWalletResult.rows[0],
-        transaction: transactionResult.rows[0],
-      };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    logger.debug(
+      `WalletModel.debit() called for ${walletId}; delegating to debitDeposited()`
+    );
+    return this.debitDeposited(
+      walletId,
+      amount,
+      description,
+      referenceType,
+      referenceId,
+      metadata
+    );
   }
 
   // ============================================
-  // NEW: SPLIT BALANCE METHODS (V2.0)
+  // SPLIT BALANCE METHODS (V2.0)
   // ============================================
 
   /**
@@ -828,6 +708,7 @@ export class WalletModel {
 
   /**
    * Get wallet with all balances
+   * Total = deposited + rebate + promotional (excludes legacy `balance` column)
    */
   static async getBalances(walletId: string): Promise<{
     deposited: number;

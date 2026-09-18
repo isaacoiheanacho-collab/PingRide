@@ -1,8 +1,8 @@
 import { CashViolationModel } from '../models/cash-violation.model';
-import { DriverLedgerModel } from '../models/driver-ledger.model';
+import { DriverSuspensionModel } from '../models/driver-suspension.model';
 import { WalletService } from './wallet.service';
-import { 
-  ICashViolation, 
+import {
+  ICashViolation,
   ICreateCashViolation,
   IUpdateCashViolation,
   CashViolationPenaltyLevel
@@ -27,7 +27,7 @@ export class PenaltyService {
     }
 
     const violation = await CashViolationModel.create(data);
-    
+
     // Apply penalty immediately
     await this.applyPenalty(violation);
 
@@ -99,6 +99,19 @@ export class PenaltyService {
     return CashViolationModel.getDriverViolationSummary(driverId);
   }
 
+  /**
+   * Get the driver's current unpaid commission balance
+   * Read directly from driver_profiles.total_commission_owed.
+   */
+  static async getDriverCommissionOwed(driverId: string): Promise<number> {
+    const pool = (await import('../config/database')).default;
+    const result = await pool.query(
+      'SELECT total_commission_owed FROM driver_profiles WHERE id = $1',
+      [driverId]
+    );
+    return parseFloat(result.rows[0]?.total_commission_owed || '0');
+  }
+
   // ============================================
   // PENALTY ACTIONS
   // ============================================
@@ -134,12 +147,22 @@ export class PenaltyService {
   ): Promise<void> {
     // Suspend driver
     await CashViolationModel.suspendDriver(violation.id);
-    
-    // Add commission debt to driver ledger
-    await DriverLedgerModel.addCashCommissionDebt(
+
+    // Increase the driver's outstanding commission debt
+    await this.incrementCommissionOwed(
       violation.driver_id,
       violation.commission_amount
     );
+
+    // Record the suspension event
+    await DriverSuspensionModel.create({
+      driver_id: violation.driver_id,
+      reason_code: 'cash_violation',
+      reason: `Cash violation — penalty level: ${violation.penalty_level}`,
+      violation_id: violation.id,
+      suspended_by: null,
+      notes: `Commission debt increased by ₦${violation.commission_amount.toFixed(2)}`,
+    });
 
     // Update driver status in driver_profiles
     await this.updateDriverStatus(violation.driver_id, 'suspended');
@@ -155,12 +178,22 @@ export class PenaltyService {
   ): Promise<void> {
     // Suspend driver
     await CashViolationModel.suspendDriver(violation.id);
-    
-    // Add commission debt to driver ledger
-    await DriverLedgerModel.addCashCommissionDebt(
+
+    // Increase the driver's outstanding commission debt
+    await this.incrementCommissionOwed(
       violation.driver_id,
       violation.commission_amount
     );
+
+    // Record the suspension event
+    await DriverSuspensionModel.create({
+      driver_id: violation.driver_id,
+      reason_code: 'cash_violation',
+      reason: `Cash violation — penalty level: ${violation.penalty_level}`,
+      violation_id: violation.id,
+      suspended_by: null,
+      notes: `Commission debt increased by ₦${violation.commission_amount.toFixed(2)}`,
+    });
 
     // Deduct from passenger wallet
     const passenger = await this.getPassengerUserId(violation.passenger_id);
@@ -193,12 +226,22 @@ export class PenaltyService {
   ): Promise<void> {
     // Suspend driver
     await CashViolationModel.suspendDriver(violation.id);
-    
-    // Add commission debt to driver ledger
-    await DriverLedgerModel.addCashCommissionDebt(
+
+    // Increase the driver's outstanding commission debt
+    await this.incrementCommissionOwed(
       violation.driver_id,
       violation.commission_amount
     );
+
+    // Record the suspension event
+    await DriverSuspensionModel.create({
+      driver_id: violation.driver_id,
+      reason_code: 'cash_violation',
+      reason: `Cash violation — penalty level: ${violation.penalty_level}`,
+      violation_id: violation.id,
+      suspended_by: null,
+      notes: `Commission debt increased by ₦${violation.commission_amount.toFixed(2)}`,
+    });
 
     // Update driver status
     await this.updateDriverStatus(violation.driver_id, 'suspended');
@@ -214,12 +257,22 @@ export class PenaltyService {
   ): Promise<void> {
     // Suspend driver
     await CashViolationModel.suspendDriver(violation.id);
-    
-    // Add commission debt to driver ledger
-    await DriverLedgerModel.addCashCommissionDebt(
+
+    // Increase the driver's outstanding commission debt
+    await this.incrementCommissionOwed(
       violation.driver_id,
       violation.commission_amount
     );
+
+    // Record the suspension event
+    await DriverSuspensionModel.create({
+      driver_id: violation.driver_id,
+      reason_code: 'cash_violation',
+      reason: `Cash violation — penalty level: permanent`,
+      violation_id: violation.id,
+      suspended_by: null,
+      notes: `Permanent ban. Commission debt increased by ₦${violation.commission_amount.toFixed(2)}`,
+    });
 
     // Update driver status to deactivated
     await this.updateDriverStatus(violation.driver_id, 'deactivated');
@@ -268,7 +321,7 @@ export class PenaltyService {
     driverId: string
   ): Promise<CashViolationPenaltyLevel> {
     const currentLevel = await CashViolationModel.getCurrentPenaltyLevel(driverId);
-    
+
     const nextLevels: Record<string, CashViolationPenaltyLevel> = {
       'first': 'second',
       'second': 'third',
@@ -303,20 +356,34 @@ export class PenaltyService {
       throw new Error('Driver is not suspended');
     }
 
-    // Check if driver has paid commission debt
-    const ledger = await DriverLedgerModel.getByDriverId(violation.driver_id);
-    if (!ledger || ledger.cash_commission_debt > 0) {
-      throw new Error('Driver has unpaid commission debt');
+    // Check the driver's outstanding commission debt
+    const owed = await this.getDriverCommissionOwed(violation.driver_id);
+    if (owed > 0) {
+      throw new Error(
+        `Driver has unpaid commission debt of ₦${owed.toFixed(2)}`
+      );
     }
 
     // Reinstate driver
     const updated = await CashViolationModel.reinstateDriver(violationId);
-    
+
     // Update driver status
     await this.updateDriverStatus(violation.driver_id, 'active');
 
     // Resolve violation
     await CashViolationModel.resolve(violationId, reinstatedBy);
+
+    // Close the active suspension row (if any)
+    const activeSuspension = await DriverSuspensionModel.getActiveByDriver(
+      violation.driver_id
+    );
+    if (activeSuspension) {
+      await DriverSuspensionModel.reinstate(
+        activeSuspension.id,
+        reinstatedBy,
+        `Debt cleared. Reinstated via violation ${violationId}.`
+      );
+    }
 
     logger.info(`Driver reinstated: ${violation.driver_id} after paying penalty`);
     return updated;
@@ -336,19 +403,57 @@ export class PenaltyService {
     // Mark payment as confirmed
     const updated = await CashViolationModel.confirmDriverPayment(violationId);
 
-    // ✅ FIXED: Reduce commission debt in driver ledger using addCashCommissionDebt
+    // Reduce the driver's outstanding commission debt by the amount paid
     if (updated) {
-      const ledger = await DriverLedgerModel.getByDriverId(violation.driver_id);
-      if (ledger) {
-        await DriverLedgerModel.addCashCommissionDebt(
-          violation.driver_id,
-          -violation.commission_amount
-        );
-      }
+      await this.decrementCommissionOwed(
+        violation.driver_id,
+        violation.commission_amount
+      );
     }
 
     logger.info(`Driver payment confirmed: ${violation.driver_id}`);
     return updated;
+  }
+
+  // ============================================
+  // COMMISSION OWED (driver_profiles.total_commission_owed)
+  // ============================================
+
+  /**
+   * Increase a driver's outstanding commission debt
+   */
+  private static async incrementCommissionOwed(
+    driverId: string,
+    amount: number
+  ): Promise<void> {
+    const pool = (await import('../config/database')).default;
+
+    await pool.query(
+      `UPDATE driver_profiles
+       SET total_commission_owed = total_commission_owed + $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [amount, driverId]
+    );
+  }
+
+  /**
+   * Decrease a driver's outstanding commission debt (floored at zero
+   * by the CHECK constraint; GREATEST is a defensive belt-and-braces).
+   */
+  private static async decrementCommissionOwed(
+    driverId: string,
+    amount: number
+  ): Promise<void> {
+    const pool = (await import('../config/database')).default;
+
+    await pool.query(
+      `UPDATE driver_profiles
+       SET total_commission_owed = GREATEST(0, total_commission_owed - $1),
+           updated_at = NOW()
+       WHERE id = $2`,
+      [amount, driverId]
+    );
   }
 
   // ============================================
@@ -362,9 +467,8 @@ export class PenaltyService {
     driverId: string,
     status: string
   ): Promise<void> {
-    // Import pool for direct query
     const pool = (await import('../config/database')).default;
-    
+
     await pool.query(
       'UPDATE driver_profiles SET driver_status = $1, updated_at = NOW() WHERE id = $2',
       [status, driverId]
@@ -377,9 +481,8 @@ export class PenaltyService {
   private static async getPassengerUserId(
     passengerId: string
   ): Promise<string | null> {
-    // Import pool for direct query
     const pool = (await import('../config/database')).default;
-    
+
     const result = await pool.query(
       'SELECT user_id FROM passenger_profiles WHERE id = $1',
       [passengerId]
@@ -401,10 +504,16 @@ export class PenaltyService {
     suspendedDrivers: number;
     countByPenaltyLevel: Record<string, number>;
   }> {
-    const [totalViolations, activeViolations, totalUnpaidCommission, countByPenaltyLevel, suspendedDrivers] = await Promise.all([
+    const [
+      totalViolations,
+      activeViolations,
+      totalUnpaidCommission,
+      countByPenaltyLevel,
+      suspendedDrivers,
+    ] = await Promise.all([
       CashViolationModel.getTotalCount(),
       this.getActiveViolationsCount(),
-      CashViolationModel.getTotalUnpaidCommission(),
+      this.getTotalUnpaidCommissionAcrossDrivers(),
       CashViolationModel.getCountByPenaltyLevel(),
       this.getSuspendedDriversCount(),
     ]);
@@ -422,9 +531,8 @@ export class PenaltyService {
    * Get active violations count
    */
   private static async getActiveViolationsCount(): Promise<number> {
-    // Import pool for direct query
     const pool = (await import('../config/database')).default;
-    
+
     const result = await pool.query(
       'SELECT COUNT(*) as count FROM cash_violations WHERE driver_reinstated = false'
     );
@@ -435,13 +543,25 @@ export class PenaltyService {
    * Get suspended drivers count
    */
   private static async getSuspendedDriversCount(): Promise<number> {
-    // Import pool for direct query
     const pool = (await import('../config/database')).default;
-    
+
     const result = await pool.query(
-      'SELECT COUNT(*) as count FROM driver_profiles WHERE driver_status = \'suspended\''
+      "SELECT COUNT(*) as count FROM driver_profiles WHERE driver_status = 'suspended'"
     );
     return parseInt(result.rows[0]?.count || '0', 10);
+  }
+
+  /**
+   * Sum the outstanding commission owed across all drivers.
+   * Reads driver_profiles.total_commission_owed (single indexed scan).
+   */
+  private static async getTotalUnpaidCommissionAcrossDrivers(): Promise<number> {
+    const pool = (await import('../config/database')).default;
+
+    const result = await pool.query(
+      'SELECT COALESCE(SUM(total_commission_owed), 0) as total FROM driver_profiles'
+    );
+    return parseFloat(result.rows[0]?.total || '0');
   }
 }
 

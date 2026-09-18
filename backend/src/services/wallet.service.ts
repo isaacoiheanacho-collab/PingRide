@@ -4,9 +4,8 @@
 
 import { WalletModel } from '../models/wallet.model';
 import { WalletTransactionModel } from '../models/wallet-transaction.model';
-import { DriverLedgerModel } from '../models/driver-ledger.model';
-import { 
-  IWallet, 
+import {
+  IWallet,
   ICreateWallet,
   IUpdateWallet,
   IWalletTransaction
@@ -52,15 +51,21 @@ export class WalletService {
   }
 
   /**
-   * Get wallet balance
+   * Get wallet total balance
+   * Total = deposited_balance + rebate_credit_balance + promotional_balance
+   * The legacy `balance` column is no longer used.
    */
   static async getBalance(userId: string): Promise<number> {
     const wallet = await this.getWalletByUserId(userId);
-    return wallet.balance;
+    return (
+      (wallet.deposited_balance || 0) +
+      (wallet.rebate_credit_balance || 0) +
+      (wallet.promotional_balance || 0)
+    );
   }
 
   /**
-   * Update wallet
+   * Update wallet (status / freeze fields only)
    */
   static async updateWallet(id: string, data: IUpdateWallet): Promise<IWallet | null> {
     return WalletModel.update(id, data);
@@ -132,7 +137,8 @@ export class WalletService {
   }
 
   /**
-   * Credit wallet
+   * Credit wallet (delegates to deposited funds)
+   * Legacy wrapper — routes money into deposited_balance.
    */
   static async credit(
     userId: string,
@@ -142,36 +148,19 @@ export class WalletService {
     referenceId?: string,
     metadata?: any
   ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    if (amount <= 0) {
-      throw new Error('Credit amount must be greater than zero');
-    }
-
-    const wallet = await this.getWalletByUserId(userId);
-
-    if (wallet.status !== 'active') {
-      throw new Error('Wallet is not active');
-    }
-
-    try {
-      const result = await WalletModel.credit(
-        wallet.id,
-        amount,
-        description,
-        referenceType,
-        referenceId,
-        metadata
-      );
-
-      logger.info(`Wallet credited: ${userId}, amount: ${amount}`);
-      return result;
-    } catch (error) {
-      logger.error('Wallet credit error:', error);
-      throw error;
-    }
+    return this.creditDepositedFunds(
+      userId,
+      amount,
+      description,
+      referenceType || 'deposit',
+      referenceId,
+      metadata
+    );
   }
 
   /**
-   * Debit wallet
+   * Debit wallet (delegates to deposited funds)
+   * Legacy wrapper — routes money out of deposited_balance.
    */
   static async debit(
     userId: string,
@@ -181,36 +170,14 @@ export class WalletService {
     referenceId?: string,
     metadata?: any
   ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    if (amount <= 0) {
-      throw new Error('Debit amount must be greater than zero');
-    }
-
-    const wallet = await this.getWalletByUserId(userId);
-
-    if (wallet.status !== 'active') {
-      throw new Error('Wallet is not active');
-    }
-
-    if (wallet.balance < amount) {
-      throw new Error('Insufficient wallet balance');
-    }
-
-    try {
-      const result = await WalletModel.debit(
-        wallet.id,
-        amount,
-        description,
-        referenceType,
-        referenceId,
-        metadata
-      );
-
-      logger.info(`Wallet debited: ${userId}, amount: ${amount}`);
-      return result;
-    } catch (error) {
-      logger.error('Wallet debit error:', error);
-      throw error;
-    }
+    return this.debitDepositedFunds(
+      userId,
+      amount,
+      description,
+      referenceType || 'payment',
+      referenceId,
+      metadata
+    );
   }
 
   /**
@@ -222,7 +189,7 @@ export class WalletService {
     referenceId?: string,
     metadata?: any
   ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    return this.credit(
+    return this.creditDepositedFunds(
       userId,
       amount,
       'Wallet top-up',
@@ -241,7 +208,7 @@ export class WalletService {
     referenceId: string,
     metadata?: any
   ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    return this.debit(
+    return this.debitDepositedFunds(
       userId,
       amount,
       'Ride payment',
@@ -260,7 +227,7 @@ export class WalletService {
     referenceId: string,
     metadata?: any
   ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    return this.credit(
+    return this.creditDepositedFunds(
       userId,
       amount,
       'Payment refund',
@@ -272,6 +239,9 @@ export class WalletService {
 
   /**
    * Reverse a transaction
+   * Uses the three-column wallet model: reverses into deposited_balance.
+   * - Reversing a debit (payment/withdrawal) → credit deposited funds back
+   * - Reversing a credit (deposit/refund/bonus/top_up) → debit deposited funds
    */
   static async reverseTransaction(
     transactionId: string,
@@ -291,15 +261,36 @@ export class WalletService {
       throw new Error('Wallet not found');
     }
 
-    if (transaction.transaction_type === 'payment' || transaction.transaction_type === 'withdrawal') {
-      const newBalance = wallet.balance + transaction.amount;
-      await WalletModel.updateBalance(wallet.id, newBalance);
-    } else if (transaction.transaction_type === 'top_up' || transaction.transaction_type === 'refund' || transaction.transaction_type === 'bonus') {
-      const newBalance = wallet.balance - transaction.amount;
-      if (newBalance < 0) {
-        throw new Error('Cannot reverse: insufficient balance');
+    const isDebit =
+      transaction.transaction_type === 'payment' ||
+      transaction.transaction_type === 'withdrawal' ||
+      transaction.transaction_type === 'rebate_usage';
+
+    if (isDebit) {
+      // Reverse a debit → credit deposited funds back
+      await WalletModel.creditDeposited(
+        wallet.id,
+        transaction.amount,
+        `Reversal: ${transaction.description}`,
+        'adjustment',
+        transaction.id,
+        { reversal_reason: reason, original_transaction_id: transaction.id }
+      );
+    } else {
+      // Reverse a credit → debit deposited funds
+      const currentDeposited = parseFloat(String(wallet.deposited_balance)) || 0;
+      if (currentDeposited < transaction.amount) {
+        throw new Error('Cannot reverse: insufficient deposited balance');
       }
-      await WalletModel.updateBalance(wallet.id, newBalance);
+
+      await WalletModel.debitDeposited(
+        wallet.id,
+        transaction.amount,
+        `Reversal: ${transaction.description}`,
+        'adjustment',
+        transaction.id,
+        { reversal_reason: reason, original_transaction_id: transaction.id }
+      );
     }
 
     return WalletTransactionModel.markReversed(transactionId, reason);
@@ -368,6 +359,11 @@ export class WalletService {
 
     if (wallet.status !== 'active') {
       throw new Error('Wallet is not active');
+    }
+
+    const currentDeposited = parseFloat(String(wallet.deposited_balance)) || 0;
+    if (currentDeposited < amount) {
+      throw new Error('Insufficient deposited balance');
     }
 
     const result = await WalletModel.debitDeposited(
@@ -473,16 +469,14 @@ export class WalletService {
   /**
    * Pay for a ride - uses credits first, then deposited funds
    * Priority: Rebate Credits → Promotional Credits → Deposited Funds
-   * 
-   * This ensures that PingRide-issued credits are used before customer funds
    */
   static async payForRide(
     userId: string,
     rideId: string,
     amount: number,
     metadata?: any
-  ): Promise<{ 
-    wallet: IWallet; 
+  ): Promise<{
+    wallet: IWallet;
     transactions: IWalletTransaction[];
     usedCredits: { type: string; amount: number }[];
   }> {
@@ -495,15 +489,19 @@ export class WalletService {
       throw new Error('Wallet is not active');
     }
 
-    // Validate amount
     if (amount <= 0) {
       throw new Error('Payment amount must be greater than zero');
     }
 
-    // Check total available balance
-    const totalBalance = (wallet.deposited_balance || 0) + (wallet.rebate_credit_balance || 0) + (wallet.promotional_balance || 0);
+    const totalBalance =
+      (wallet.deposited_balance || 0) +
+      (wallet.rebate_credit_balance || 0) +
+      (wallet.promotional_balance || 0);
+
     if (totalBalance < amount) {
-      throw new Error(`Insufficient balance. Available: ${totalBalance}, Required: ${amount}`);
+      throw new Error(
+        `Insufficient balance. Available: ${totalBalance}, Required: ${amount}`
+      );
     }
 
     let remainingAmount = amount;
@@ -520,8 +518,8 @@ export class WalletService {
         `Ride payment - ${rideId} (rebate credits)`,
         'ride',
         rideId,
-        { 
-          ...metadata, 
+        {
+          ...metadata,
           ride_id: rideId,
           credit_type: 'rebate',
           priority: 1,
@@ -531,32 +529,22 @@ export class WalletService {
       usedCredits.push({ type: 'rebate', amount: toUse });
       remainingAmount -= toUse;
       currentWallet = result.wallet;
-      
-      logger.info(`Used rebate credits for ride ${rideId}: ${toUse}, remaining: ${remainingAmount}`);
+
+      logger.info(
+        `Used rebate credits for ride ${rideId}: ${toUse}, remaining: ${remainingAmount}`
+      );
     }
 
     // Step 2: Use promotional credits if available (PingRide-issued)
-    // Note: Promotional credit debit is currently commented out until
-    // the WalletModel.debitPromotional method is implemented
     if (currentWallet.promotional_balance > 0 && remainingAmount > 0) {
       const promoBalance = currentWallet.promotional_balance;
-      logger.info(`Promotional credits available: ${promoBalance}, but debit method not yet implemented. Skipping.`);
-      
+      logger.info(
+        `Promotional credits available: ${promoBalance}, but debit method not yet implemented. Skipping.`
+      );
+
       // TODO: When promotional debit is implemented in WalletModel:
       // const toUse = Math.min(remainingAmount, currentWallet.promotional_balance);
-      // const result = await WalletModel.debitPromotional(
-      //   currentWallet.id,
-      //   toUse,
-      //   `Ride payment - ${rideId} (promotional credits)`,
-      //   'ride',
-      //   rideId,
-      //   { ...metadata, ride_id: rideId, credit_type: 'promotional', priority: 2 }
-      // );
-      // transactions.push(result.transaction);
-      // usedCredits.push({ type: 'promotional', amount: toUse });
-      // remainingAmount -= toUse;
-      // currentWallet = result.wallet;
-      // logger.info(`Used promotional credits for ride ${rideId}: ${toUse}, remaining: ${remainingAmount}`);
+      // const result = await WalletModel.debitPromotional(...)
     }
 
     // Step 3: Use deposited funds for remaining (customer-funded, withdrawable)
@@ -568,8 +556,8 @@ export class WalletService {
         `Ride payment - ${rideId} (deposited funds)`,
         'ride',
         rideId,
-        { 
-          ...metadata, 
+        {
+          ...metadata,
           ride_id: rideId,
           credit_type: 'deposited',
           priority: 3,
@@ -579,8 +567,10 @@ export class WalletService {
       usedCredits.push({ type: 'deposited', amount: toUse });
       remainingAmount -= toUse;
       currentWallet = result.wallet;
-      
-      logger.info(`Used deposited funds for ride ${rideId}: ${toUse}, remaining: ${remainingAmount}`);
+
+      logger.info(
+        `Used deposited funds for ride ${rideId}: ${toUse}, remaining: ${remainingAmount}`
+      );
     }
 
     // Step 4: Check if fully paid
@@ -589,10 +579,11 @@ export class WalletService {
       throw new Error(`Insufficient balance. Need ${amount}, have ${totalUsed}`);
     }
 
-    // Get final wallet state
     const finalWallet = await this.getWalletByUserId(userId);
 
-    logger.info(`Ride payment completed: ${rideId}, amount: ${amount}, credits used: ${usedCredits.length} types`);
+    logger.info(
+      `Ride payment completed: ${rideId}, amount: ${amount}, credits used: ${usedCredits.length} types`
+    );
 
     return {
       wallet: finalWallet!,
@@ -603,7 +594,6 @@ export class WalletService {
 
   /**
    * Check if user can pay for a ride with their current balance
-   * Returns the payment breakdown by credit type
    */
   static async canPayForRide(
     userId: string,
@@ -651,7 +641,6 @@ export class WalletService {
 
   /**
    * Get payment priority breakdown for a ride
-   * Shows how the payment would be split across credit types
    */
   static async getPaymentBreakdown(
     userId: string,
@@ -679,21 +668,18 @@ export class WalletService {
     let promotionalUsed = 0;
     let depositedUsed = 0;
 
-    // Step 1: Rebate credits
     const rebateBalance = wallet.rebate_credit_balance || 0;
     if (remaining > 0 && rebateBalance > 0) {
       rebateUsed = Math.min(remaining, rebateBalance);
       remaining -= rebateUsed;
     }
 
-    // Step 2: Promotional credits
     const promoBalance = wallet.promotional_balance || 0;
     if (remaining > 0 && promoBalance > 0) {
       promotionalUsed = Math.min(remaining, promoBalance);
       remaining -= promotionalUsed;
     }
 
-    // Step 3: Deposited funds
     const depositedBalance = wallet.deposited_balance || 0;
     if (remaining > 0 && depositedBalance > 0) {
       depositedUsed = Math.min(remaining, depositedBalance);
@@ -727,25 +713,32 @@ export class WalletService {
       return { deposited: 0, rebateCredit: 0, promotional: 0, total: 0 };
     }
 
+    const deposited = wallet.deposited_balance || 0;
+    const rebateCredit = wallet.rebate_credit_balance || 0;
+    const promotional = wallet.promotional_balance || 0;
+
     return {
-      deposited: wallet.deposited_balance || 0,
-      rebateCredit: wallet.rebate_credit_balance || 0,
-      promotional: wallet.promotional_balance || 0,
-      total: (wallet.deposited_balance || 0) + (wallet.rebate_credit_balance || 0) + (wallet.promotional_balance || 0),
+      deposited,
+      rebateCredit,
+      promotional,
+      total: deposited + rebateCredit + promotional,
     };
   }
 
   /**
    * Get available balance for a specific purpose
    */
-  static async getAvailableBalance(userId: string, purpose: 'ride' | 'withdrawal'): Promise<number> {
+  static async getAvailableBalance(
+    userId: string,
+    purpose: 'ride' | 'withdrawal'
+  ): Promise<number> {
     const balance = await this.getDetailedBalance(userId);
-    
+
     if (purpose === 'withdrawal') {
       // Only deposited funds can be withdrawn
       return balance.deposited;
     }
-    
+
     // For rides, all balances are available
     return balance.total;
   }
@@ -764,7 +757,7 @@ export class WalletService {
     transactionCount: number;
   }> {
     const wallet = await this.getWalletByUserId(userId);
-    
+
     const [totalCredits, totalDebits, transactionCount] = await Promise.all([
       WalletTransactionModel.getTotalCredits(wallet.id),
       WalletTransactionModel.getTotalDebits(wallet.id),
@@ -813,9 +806,7 @@ export class WalletService {
 
   /**
    * @deprecated Withdrawals are now automatic via Paystack subaccount.
-   * This method is kept for historical data access only.
-   * DO NOT USE for new withdrawals. Drivers receive automatic payments
-   * when passengers pay for rides via the split payment system.
+   * Read-only historical access.
    */
   static async getWithdrawals(
     driverId: string,
@@ -844,49 +835,7 @@ export class WalletService {
 
   /**
    * @deprecated Withdrawals are now automatic via Paystack subaccount.
-   * This method is DEPRECATED. DO NOT USE for new operations.
-   * It is kept for potential rollback only.
-   */
-  static async transferDriverEarningsToWallet(
-    driverId: string,
-    amount: number,
-    description: string,
-    referenceId?: string
-  ): Promise<{ wallet: IWallet; transaction: IWalletTransaction }> {
-    logger.warn('⚠️ transferDriverEarningsToWallet() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
-    const ledger = await DriverLedgerModel.getByDriverId(driverId);
-    if (!ledger) {
-      throw new Error('Driver ledger not found');
-    }
-
-    if (ledger.withdrawable_balance < amount) {
-      throw new Error('Insufficient withdrawable balance');
-    }
-
-    const driver = await DriverLedgerModel.getWithDriverDetails(driverId);
-    if (!driver) {
-      throw new Error('Driver not found');
-    }
-
-    const creditResult = await this.credit(
-      driver.user_id,
-      amount,
-      description,
-      'driver_earnings',
-      referenceId || driverId
-    );
-
-    await DriverLedgerModel.deductWithdrawal(driverId, amount);
-
-    logger.info(`Transferred ₦${amount} from driver ledger to wallet for driver: ${driverId}`);
-    return creditResult;
-  }
-
-  /**
-   * @deprecated Withdrawals are now automatic via Paystack subaccount.
-   * This method is DEPRECATED. DO NOT USE for new operations.
-   * It is kept for potential rollback only.
+   * DO NOT USE for new operations.
    */
   static async createWithdrawal(
     driverId: string,
@@ -896,14 +845,20 @@ export class WalletService {
     accountNumber: string,
     bankName?: string
   ): Promise<any> {
-    logger.warn('⚠️ createWithdrawal() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
-    const ledger = await DriverLedgerModel.getByDriverId(driverId);
-    if (!ledger) {
+    logger.warn(
+      '⚠️ createWithdrawal() is DEPRECATED. Payments are automatic via Paystack subaccount.'
+    );
+
+    const ledger = await pool.query(
+      'SELECT * FROM driver_ledger WHERE driver_id = $1',
+      [driverId]
+    );
+    if (ledger.rows.length === 0) {
       throw new Error('Driver ledger not found');
     }
 
-    if (ledger.withdrawable_balance < amount) {
+    const ledgerRow = ledger.rows[0];
+    if (parseFloat(ledgerRow.withdrawable_balance) < amount) {
       throw new Error('Insufficient withdrawable balance');
     }
 
@@ -921,7 +876,7 @@ export class WalletService {
       RETURNING *`,
       [
         driverId,
-        ledger.id,
+        ledgerRow.id,
         amount,
         method,
         accountName,
@@ -936,8 +891,7 @@ export class WalletService {
 
   /**
    * @deprecated Withdrawals are now automatic via Paystack subaccount.
-   * This method is DEPRECATED. DO NOT USE for new operations.
-   * It is kept for potential rollback only.
+   * DO NOT USE for new operations.
    */
   static async processWithdrawal(
     withdrawalId: string,
@@ -945,8 +899,10 @@ export class WalletService {
     reference?: string,
     failureReason?: string
   ): Promise<any> {
-    logger.warn('⚠️ processWithdrawal() is DEPRECATED. Payments are automatic via Paystack subaccount.');
-    
+    logger.warn(
+      '⚠️ processWithdrawal() is DEPRECATED. Payments are automatic via Paystack subaccount.'
+    );
+
     const result = await pool.query(
       `UPDATE withdrawals 
        SET status = $1,
@@ -970,7 +926,7 @@ export class WalletService {
 
   /**
    * Credit promotional credits
-   * TODO: Implement when promotional system is ready
+   * TODO: Implement dedicated promotional balance handler in WalletModel.
    */
   static async creditPromotionalCredits(
     userId: string,
@@ -993,18 +949,9 @@ export class WalletService {
       throw new Error('Wallet is not active');
     }
 
-    // TODO: Add promotional credit method to WalletModel
-    // const result = await WalletModel.creditPromotional(
-    //   wallet.id,
-    //   amount,
-    //   description,
-    //   referenceType,
-    //   referenceId,
-    //   metadata
-    // );
-
-    // For now, use regular credit with promotional note
-    const result = await this.credit(
+    // TODO: Route to WalletModel.creditPromotional once it exists.
+    // Until then, promotional credits go into the deposited_balance bucket.
+    const result = await this.creditDepositedFunds(
       userId,
       amount,
       `${description} (promotional)`,
@@ -1022,15 +969,14 @@ export class WalletService {
   // ============================================
 
   /**
-   * Check and expire rebate credits that have passed expiry
-   * This should be run as a scheduled job
+   * Expire rebate credits that have passed expiry
+   * Scheduled job.
    */
   static async expireRebateCredits(): Promise<{
     expired: number;
     totalAmount: number;
   }> {
     try {
-      // Get all active credits with expiry date in the past
       const result = await pool.query(
         `SELECT id, passenger_id, remaining_amount 
          FROM rebate_credits 
@@ -1046,7 +992,6 @@ export class WalletService {
       let expiredCount = 0;
 
       for (const credit of result.rows) {
-        // Update credit status to expired
         await pool.query(
           `UPDATE rebate_credits 
            SET status = 'expired', updated_at = NOW() 
@@ -1054,10 +999,12 @@ export class WalletService {
           [credit.id]
         );
 
-        // Remove the expired amount from wallet's rebate balance
         const wallet = await this.getWalletByUserId(credit.passenger_id);
         if (wallet) {
-          const newRebateBalance = Math.max(0, (wallet.rebate_credit_balance || 0) - credit.remaining_amount);
+          const newRebateBalance = Math.max(
+            0,
+            (wallet.rebate_credit_balance || 0) - credit.remaining_amount
+          );
           await pool.query(
             `UPDATE wallets 
              SET rebate_credit_balance = $1, updated_at = NOW() 
@@ -1065,7 +1012,6 @@ export class WalletService {
             [newRebateBalance, wallet.id]
           );
 
-          // Create a transaction record for the expiry
           await WalletTransactionModel.create({
             wallet_id: wallet.id,
             transaction_type: 'adjustment',
