@@ -105,6 +105,26 @@ CREATE INDEX IF NOT EXISTS idx_admin_role ON admin_profiles(admin_role);
 CREATE INDEX IF NOT EXISTS idx_admin_status ON admin_profiles(status);
 CREATE INDEX IF NOT EXISTS idx_admin_user ON admin_profiles(user_id);
 
+-- User Consents table (NDPA 2023)
+-- Append-only. Every grant or revoke writes a new row.
+-- The most recent row per (user_id, consent_type) is authoritative.
+CREATE TABLE IF NOT EXISTS user_consents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    consent_type VARCHAR(50) NOT NULL,
+    consent_version VARCHAR(20) NOT NULL,
+    granted BOOLEAN NOT NULL DEFAULT TRUE,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    metadata JSONB,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT user_consents_type_check CHECK (consent_type IN ('terms_of_service', 'privacy_policy', 'kyc_data_sharing', 'liveness_capture'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_consents_user ON user_consents(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_consents_user_type ON user_consents(user_id, consent_type, created_at DESC);
+
 -- ============================================
 -- PASSENGER MODULE
 -- ============================================
@@ -222,9 +242,58 @@ CREATE TABLE IF NOT EXISTS driver_profiles (
     max_distance_per_day INTEGER DEFAULT 300,
     vehicle_id UUID,
     location_geo GEOGRAPHY(Point, 4326),
+
+    -- ============================================
+    -- PHASE 2B — SUBACCOUNT
+    -- ============================================
+    subaccount_code VARCHAR(255),
+    bank_code VARCHAR(20),
+    account_number VARCHAR(20),
+    account_name VARCHAR(255),
+    subaccount_created_at TIMESTAMP,
+    subaccount_status VARCHAR(20) DEFAULT 'pending',
+
+    -- ============================================
+    -- PHASE 2C — IDENTITY KYC (MANUAL REVIEW)
+    -- ============================================
+    license_verified BOOLEAN DEFAULT FALSE,
+    license_verification_provider VARCHAR(50),
+    license_verified_at TIMESTAMPTZ,
+    license_expiry_date DATE,
+    license_photo_url TEXT,
+    license_back_url TEXT,
+    license_state_of_issue VARCHAR(50),
+
+    nin VARCHAR(20),
+    nin_id_card_url TEXT,
+    nin_verified BOOLEAN DEFAULT FALSE,
+
+    bvn VARCHAR(20),
+    bvn_verified BOOLEAN DEFAULT FALSE,
+
+    selfie_url TEXT,
+
+    liveness_check_required BOOLEAN DEFAULT FALSE,
+    last_liveness_check_at TIMESTAMPTZ,
+    liveness_check_failures INTEGER DEFAULT 0,
+
+    identity_fully_verified BOOLEAN DEFAULT FALSE,
+    identity_verified_at TIMESTAMPTZ,
+    identity_submitted_at TIMESTAMPTZ,
+    identity_reviewed_at TIMESTAMPTZ,
+    identity_reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    identity_review_notes TEXT,
+
+    -- ============================================
+    -- COMMISSION OWED (cash-violation debt)
+    -- ============================================
+    total_commission_owed NUMERIC NOT NULL DEFAULT 0.00,
+
     CONSTRAINT driver_profiles_driver_status_check CHECK (driver_status IN ('pending', 'under_review', 'approved', 'active', 'suspended', 'rejected', 'deactivated')),
     CONSTRAINT driver_profiles_availability_status_check CHECK (availability_status IN ('online', 'offline', 'on_trip', 'unavailable')),
-    CONSTRAINT driver_profiles_kyc_status_check CHECK (kyc_status IN ('pending', 'under_review', 'approved', 'rejected', 'suspended'))
+    CONSTRAINT driver_profiles_kyc_status_check CHECK (kyc_status IN ('pending', 'under_review', 'approved', 'rejected', 'suspended')),
+    CONSTRAINT driver_profiles_subaccount_status_check CHECK (subaccount_status IN ('pending', 'active', 'failed') OR subaccount_status IS NULL),
+    CONSTRAINT driver_profiles_total_commission_owed_check CHECK (total_commission_owed >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_driver_kyc ON driver_profiles(kyc_status);
@@ -232,6 +301,10 @@ CREATE INDEX IF NOT EXISTS idx_driver_rating ON driver_profiles(rating_average);
 CREATE INDEX IF NOT EXISTS idx_driver_status ON driver_profiles(driver_status, availability_status);
 CREATE INDEX IF NOT EXISTS idx_driver_user ON driver_profiles(user_id);
 CREATE INDEX IF NOT EXISTS idx_driver_location_geo ON driver_profiles USING GIST (location_geo);
+CREATE INDEX IF NOT EXISTS idx_driver_identity_review
+  ON driver_profiles(identity_submitted_at)
+  WHERE identity_submitted_at IS NOT NULL AND identity_reviewed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_driver_commission_owed ON driver_profiles(total_commission_owed) WHERE total_commission_owed > 0;
 
 -- Driver Availability table
 CREATE TABLE IF NOT EXISTS driver_availability (
@@ -347,13 +420,60 @@ CREATE TABLE IF NOT EXISTS vehicles (
     registration_expiry DATE,
     insurance_expiry DATE,
     roadworthiness_expiry DATE,
+
+    -- ============================================
+    -- PHASE 2D — VEHICLE COMPLIANCE (MANUAL REVIEW)
+    -- ============================================
+    plate_verified BOOLEAN DEFAULT FALSE,
+    plate_verification_provider VARCHAR(50),
+    plate_verified_at TIMESTAMPTZ,
+    plate_owner_name VARCHAR(255),
+    plate_owner_match BOOLEAN,
+    plate_vehicle_make VARCHAR(100),
+    plate_vehicle_model VARCHAR(100),
+    plate_vehicle_vin VARCHAR(100),
+
+    poc_document_url TEXT,
+    poc_verified BOOLEAN DEFAULT FALSE,
+
+    vehicle_license_url TEXT,
+    vehicle_license_verified BOOLEAN DEFAULT FALSE,
+
+    roadworthiness_verified BOOLEAN DEFAULT FALSE,
+    roadworthiness_verified_at TIMESTAMPTZ,
+    roadworthiness_verified_by UUID REFERENCES users(id) ON DELETE SET NULL,
+
+    hackney_permit_url TEXT,
+    hackney_permit_verified BOOLEAN DEFAULT FALSE,
+    hackney_permit_expiry DATE,
+    hackney_permit_verified_at TIMESTAMPTZ,
+    hackney_permit_verified_by UUID REFERENCES users(id) ON DELETE SET NULL,
+
+    insurance_verified BOOLEAN DEFAULT FALSE,
+    insurance_policy_number VARCHAR(100),
+    insurance_provider VARCHAR(255),
+    insurance_verification_method VARCHAR(20),
+    insurance_verified_at TIMESTAMPTZ,
+    insurance_verified_by UUID REFERENCES users(id) ON DELETE SET NULL,
+
+    compliance_fully_verified BOOLEAN DEFAULT FALSE,
+    compliance_verified_at TIMESTAMPTZ,
+    compliance_submitted_at TIMESTAMPTZ,
+    compliance_reviewed_at TIMESTAMPTZ,
+    compliance_reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    compliance_notes TEXT,
+
     CONSTRAINT vehicles_vehicle_type_check CHECK (vehicle_type IN ('standard', 'premium', 'executive', 'luxury')),
-    CONSTRAINT vehicles_status_check CHECK (status IN ('active', 'pending_approval', 'suspended', 'deactivated', 'rejected'))
+    CONSTRAINT vehicles_status_check CHECK (status IN ('active', 'pending_approval', 'suspended', 'deactivated', 'rejected')),
+    CONSTRAINT vehicles_insurance_method_check CHECK (insurance_verification_method IS NULL OR insurance_verification_method IN ('api', 'manual'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_vehicle_driver ON vehicles(driver_id);
 CREATE INDEX IF NOT EXISTS idx_vehicle_registration ON vehicles(registration_number);
 CREATE INDEX IF NOT EXISTS idx_vehicle_status ON vehicles(status);
+CREATE INDEX IF NOT EXISTS idx_vehicle_compliance_review
+  ON vehicles(compliance_submitted_at)
+  WHERE compliance_submitted_at IS NOT NULL AND compliance_reviewed_at IS NULL;
 
 -- Driver Risk Insurance table
 CREATE TABLE IF NOT EXISTS driver_risk_insurance (
@@ -426,7 +546,7 @@ CREATE TABLE IF NOT EXISTS ride_requests (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     timezone_id VARCHAR(50) DEFAULT 'Africa/Lagos',
     CONSTRAINT ride_requests_vehicle_type_check CHECK (vehicle_type IN ('standard', 'premium', 'executive')),
-    CONSTRAINT ride_requests_status_check CHECK (status IN ('pending', 'bidding', 'assigned', 'expired', 'cancelled')),
+    CONSTRAINT ride_requests_status_check CHECK (status IN ('pending', 'bidding', 'assigned', 'completed', 'expired', 'cancelled')),
     CONSTRAINT ride_requests_cancelled_by_check CHECK (cancelled_by IN ('passenger', 'driver', 'system'))
 );
 
@@ -486,6 +606,7 @@ CREATE TABLE IF NOT EXISTS rides (
     final_distance_km NUMERIC,
     duration_minutes INTEGER,
     bid_id UUID REFERENCES ride_bids(id) ON DELETE SET NULL,
+    ride_request_id UUID REFERENCES ride_requests(id) ON DELETE SET NULL,
     bid_amount NUMERIC,
     driver_arrived_at TIMESTAMPTZ,
     dispute_initiated_at TIMESTAMP,
@@ -513,6 +634,7 @@ CREATE INDEX IF NOT EXISTS idx_ride_status ON rides(status);
 CREATE INDEX IF NOT EXISTS idx_rides_programme_period ON rides(programme_period_id);
 CREATE INDEX IF NOT EXISTS idx_rides_eligible ON rides(ride_eligible_for_qualification);
 CREATE INDEX IF NOT EXISTS idx_rides_fraud_status ON rides(fraud_review_status);
+CREATE INDEX IF NOT EXISTS idx_rides_ride_request_id ON rides(ride_request_id);
 
 -- Ride Cancellations table
 CREATE TABLE IF NOT EXISTS ride_cancellations (
@@ -617,7 +739,22 @@ CREATE TABLE IF NOT EXISTS wallet_transactions (
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     reversed_at TIMESTAMP,
-    CONSTRAINT wallet_transactions_transaction_type_check CHECK (transaction_type IN ('top_up', 'payment', 'refund', 'commission', 'withdrawal', 'adjustment', 'bonus')),
+
+    CONSTRAINT wallet_transactions_transaction_type_check CHECK (transaction_type IN (
+        'top_up', 'topup', 'deposit',
+        'payment', 'payout', 'withdrawal',
+        'refund', 'bonus', 'commission', 'adjustment',
+        'rebate_credit', 'rebate_usage',
+        'promotion', 'driver_earnings'
+    )),
+    CONSTRAINT wallet_transactions_reference_type_check CHECK (reference_type IS NULL OR reference_type IN (
+        'ride', 'payout', 'refund', 'promotion',
+        'topup', 'top_up', 'deposit', 'dva_transfer',
+        'bank_transfer', 'bank_transfer_reconciliation',
+        'withdrawal', 'adjustment', 'payment',
+        'commission', 'bonus',
+        'rebate', 'rebate_expiry', 'driver_earnings'
+    )),
     CONSTRAINT wallet_transactions_status_check CHECK (status IN ('pending', 'completed', 'failed', 'reversed')),
     CONSTRAINT wallet_transactions_amount_check CHECK (amount > 0)
 );
@@ -651,9 +788,19 @@ CREATE TABLE IF NOT EXISTS payments (
     processed_at TIMESTAMP,
     settled_at TIMESTAMP,
     payment_type VARCHAR(30) DEFAULT 'ride',
-    CONSTRAINT payments_status_check CHECK (status IN ('pending', 'authorised', 'captured', 'paid', 'failed', 'refunded', 'partially_refunded', 'cancelled')),
-    CONSTRAINT payments_payment_method_check CHECK (payment_method IN ('card', 'bank_transfer', 'wallet', 'cash', 'promo_code')),
-    CONSTRAINT payments_payment_type_check CHECK (payment_type IN ('ride', 'top_up', 'withdrawal', 'refund'))
+
+    CONSTRAINT payments_status_check CHECK (status IN (
+        'pending', 'authorised', 'captured',
+        'processing', 'paid', 'successful',
+        'failed', 'refunded', 'partially_refunded',
+        'cancelled', 'disputed', 'reversed'
+    )),
+    CONSTRAINT payments_payment_method_check CHECK (payment_method IN ('card', 'wallet', 'bank_transfer', 'mobile_money', 'cash', 'promo_code')),
+    CONSTRAINT payments_payment_type_check CHECK (payment_type IN (
+        'ride', 'top_up', 'wallet_topup',
+        'withdrawal', 'wallet_withdrawal',
+        'refund', 'adjustment'
+    ))
 );
 
 CREATE INDEX IF NOT EXISTS idx_payment_created ON payments(created_at);
@@ -704,6 +851,7 @@ CREATE INDEX IF NOT EXISTS idx_refunds_ride ON refunds(ride_id);
 CREATE INDEX IF NOT EXISTS idx_refunds_transaction ON refunds(transaction_id);
 
 -- Withdrawals table
+-- Deprecated for new writes. Kept for read-only historical access.
 CREATE TABLE IF NOT EXISTS withdrawals (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     driver_id UUID NOT NULL REFERENCES driver_profiles(id) ON DELETE RESTRICT,
@@ -728,6 +876,7 @@ CREATE INDEX IF NOT EXISTS idx_withdrawals_driver ON withdrawals(driver_id);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status);
 
 -- Settlements table
+-- Deprecated for new writes. Kept for read-only historical access.
 CREATE TABLE IF NOT EXISTS settlements (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     driver_id UUID NOT NULL REFERENCES driver_profiles(id) ON DELETE RESTRICT,
@@ -750,391 +899,53 @@ CREATE TABLE IF NOT EXISTS settlements (
 CREATE INDEX IF NOT EXISTS idx_settlements_driver ON settlements(driver_id);
 CREATE INDEX IF NOT EXISTS idx_settlements_status ON settlements(status);
 
--- Fare Calculations table
-CREATE TABLE IF NOT EXISTS fare_calculations (
+-- Driver Ledger tables
+CREATE TABLE IF NOT EXISTS driver_ledger (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ride_id UUID NOT NULL UNIQUE REFERENCES rides(id) ON DELETE RESTRICT,
-    estimated_distance_km NUMERIC,
-    estimated_duration_min INTEGER,
-    base_fare NUMERIC,
-    bid_amount NUMERIC,
-    final_fare NUMERIC NOT NULL,
-    commission_amount NUMERIC NOT NULL DEFAULT 0.00,
-    commission_rate NUMERIC DEFAULT 15.00,
-    driver_earnings NUMERIC NOT NULL DEFAULT 0.00,
-    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
-    calculated_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
--- Fare Estimates table
-CREATE TABLE IF NOT EXISTS fare_estimates (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    passenger_id UUID NOT NULL REFERENCES passenger_profiles(id) ON DELETE RESTRICT,
-    pickup_latitude NUMERIC NOT NULL,
-    pickup_longitude NUMERIC NOT NULL,
-    destination_latitude NUMERIC NOT NULL,
-    destination_longitude NUMERIC NOT NULL,
-    estimated_fare NUMERIC NOT NULL,
-    estimated_distance_km NUMERIC,
-    estimated_duration_min INTEGER,
-    requested_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_fare_estimates_passenger ON fare_estimates(passenger_id);
-CREATE INDEX IF NOT EXISTS idx_fare_estimates_requested ON fare_estimates(requested_at);
-
--- ============================================
--- RATINGS & TRUST
--- ============================================
-
--- Ratings table
-CREATE TABLE IF NOT EXISTS ratings (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ride_id UUID NOT NULL UNIQUE REFERENCES rides(id) ON DELETE RESTRICT,
-    rater_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    rated_user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    rating INTEGER NOT NULL,
-    comment TEXT,
+    driver_id UUID NOT NULL UNIQUE REFERENCES driver_profiles(id) ON DELETE RESTRICT,
+    digital_earnings NUMERIC NOT NULL DEFAULT 0.00,
+    cash_commission_debt NUMERIC NOT NULL DEFAULT 0.00,
+    bonus_earnings NUMERIC NOT NULL DEFAULT 0.00,
+    adjustment_earnings NUMERIC NOT NULL DEFAULT 0.00,
+    total_commission_deducted NUMERIC NOT NULL DEFAULT 0.00,
+    total_withdrawals NUMERIC NOT NULL DEFAULT 0.00,
+    total_refunds NUMERIC NOT NULL DEFAULT 0.00,
+    net_balance NUMERIC NOT NULL DEFAULT 0.00,
+    withdrawable_balance NUMERIC NOT NULL DEFAULT 0.00,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT ratings_rating_check CHECK (rating BETWEEN 1 AND 5),
-    CONSTRAINT ratings_ride_id_rater_id_rated_user_id_key UNIQUE (ride_id, rater_id, rated_user_id)
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CONSTRAINT driver_ledger_status_check CHECK (status IN ('active', 'suspended', 'closed'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_rating_created ON ratings(created_at);
-CREATE INDEX IF NOT EXISTS idx_rating_rated ON ratings(rated_user_id);
-CREATE INDEX IF NOT EXISTS idx_rating_rater ON ratings(rater_id);
-CREATE INDEX IF NOT EXISTS idx_rating_ride ON ratings(ride_id);
+CREATE INDEX IF NOT EXISTS idx_driver_ledger_driver ON driver_ledger(driver_id);
 
--- ============================================
--- DISPUTES & INCIDENTS
--- ============================================
-
--- Disputes table
-CREATE TABLE IF NOT EXISTS disputes (
+CREATE TABLE IF NOT EXISTS driver_ledger_transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ride_id UUID REFERENCES rides(id) ON DELETE SET NULL,
-    payment_id UUID REFERENCES payments(id) ON DELETE SET NULL,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    category VARCHAR(50) NOT NULL,
+    driver_ledger_id UUID NOT NULL REFERENCES driver_ledger(id) ON DELETE RESTRICT,
+    transaction_type VARCHAR(30) NOT NULL,
+    amount NUMERIC NOT NULL,
+    balance_before NUMERIC NOT NULL,
+    balance_after NUMERIC NOT NULL,
+    reference_type VARCHAR(50),
+    reference_id UUID,
     description TEXT NOT NULL,
-    status VARCHAR(30) NOT NULL DEFAULT 'open',
-    evidence_urls JSONB,
-    assigned_to UUID REFERENCES users(id) ON DELETE SET NULL,
-    resolution TEXT,
-    resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    resolved_at TIMESTAMP,
+    metadata JSONB,
+    status VARCHAR(20) NOT NULL DEFAULT 'completed',
+    completed_at TIMESTAMP,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT disputes_category_check CHECK (category IN ('payment', 'ride_quality', 'driver_behavior', 'passenger_behavior', 'cancellation', 'other')),
-    CONSTRAINT disputes_status_check CHECK (status IN ('open', 'under_review', 'resolved', 'closed'))
+    CONSTRAINT driver_ledger_transactions_type_check CHECK (transaction_type IN ('earning', 'commission', 'bonus', 'adjustment', 'withdrawal', 'refund')),
+    CONSTRAINT driver_ledger_transactions_status_check CHECK (status IN ('pending', 'completed', 'failed', 'reversed'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_dispute_created ON disputes(created_at);
-CREATE INDEX IF NOT EXISTS idx_dispute_ride ON disputes(ride_id);
-CREATE INDEX IF NOT EXISTS idx_dispute_status ON disputes(status);
-CREATE INDEX IF NOT EXISTS idx_dispute_user ON disputes(user_id);
-
--- Incidents table
-CREATE TABLE IF NOT EXISTS incidents (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ride_id UUID REFERENCES rides(id) ON DELETE SET NULL,
-    reporter_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    reporter_type VARCHAR(20) NOT NULL,
-    incident_type VARCHAR(50) NOT NULL,
-    severity VARCHAR(20) NOT NULL,
-    description TEXT NOT NULL,
-    evidence_urls JSONB,
-    status VARCHAR(20) DEFAULT 'reported',
-    assigned_to UUID REFERENCES users(id) ON DELETE SET NULL,
-    resolution TEXT,
-    reported_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    resolved_at TIMESTAMP,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT incidents_reporter_type_check CHECK (reporter_type IN ('passenger', 'driver', 'admin')),
-    CONSTRAINT incidents_incident_type_check CHECK (incident_type IN ('accident', 'harassment', 'theft', 'misconduct', 'vehicle_issue', 'other')),
-    CONSTRAINT incidents_severity_check CHECK (severity IN ('low', 'medium', 'high', 'critical')),
-    CONSTRAINT incidents_status_check CHECK (status IN ('reported', 'under_review', 'resolved', 'closed'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_incidents_reporter ON incidents(reporter_id);
-CREATE INDEX IF NOT EXISTS idx_incidents_ride ON incidents(ride_id);
-CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
-
--- SOS Events table
-CREATE TABLE IF NOT EXISTS sos_events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    user_type VARCHAR(20) NOT NULL,
-    ride_id UUID REFERENCES rides(id) ON DELETE SET NULL,
-    latitude NUMERIC NOT NULL,
-    longitude NUMERIC NOT NULL,
-    status VARCHAR(20) DEFAULT 'active',
-    escalated_to JSONB,
-    response_notes TEXT,
-    resolved_at TIMESTAMP,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT sos_events_user_type_check CHECK (user_type IN ('passenger', 'driver')),
-    CONSTRAINT sos_events_status_check CHECK (status IN ('active', 'resolved', 'dismissed'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_sos_ride ON sos_events(ride_id);
-CREATE INDEX IF NOT EXISTS idx_sos_user ON sos_events(user_id);
-
--- ============================================
--- NOTIFICATIONS MODULE
--- ============================================
-
--- Notification Templates table
-CREATE TABLE IF NOT EXISTS notification_templates (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(100) NOT NULL UNIQUE,
-    category VARCHAR(50) NOT NULL,
-    type VARCHAR(50) NOT NULL,
-    title_template VARCHAR(255),
-    body_template TEXT NOT NULL,
-    variables JSONB,
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT notification_templates_type_check CHECK (type IN ('push', 'sms', 'email', 'in_app'))
-);
-
--- Notifications table
-CREATE TABLE IF NOT EXISTS notifications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    type VARCHAR(50) NOT NULL,
-    channel VARCHAR(30) NOT NULL,
-    title VARCHAR(255),
-    body TEXT NOT NULL,
-    data JSONB,
-    action_url VARCHAR(500),
-    status VARCHAR(30) NOT NULL DEFAULT 'pending',
-    external_reference VARCHAR(255),
-    sent_at TIMESTAMP,
-    delivered_at TIMESTAMP,
-    read_at TIMESTAMP,
-    failed_reason TEXT,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT notifications_type_check CHECK (type IN ('ride_update', 'payment', 'promotion', 'system', 'security')),
-    CONSTRAINT notifications_channel_check CHECK (channel IN ('push', 'sms', 'email', 'in_app')),
-    CONSTRAINT notifications_status_check CHECK (status IN ('pending', 'sent', 'delivered', 'read', 'failed'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_notification_created ON notifications(created_at);
-CREATE INDEX IF NOT EXISTS idx_notification_status ON notifications(status);
-CREATE INDEX IF NOT EXISTS idx_notification_user ON notifications(user_id);
-CREATE INDEX IF NOT EXISTS idx_notification_user_status ON notifications(user_id, status);
-
--- ============================================
--- PROMOTIONS MODULE
--- ============================================
-
--- Promotions table
-CREATE TABLE IF NOT EXISTS promotions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    code VARCHAR(50) NOT NULL UNIQUE,
-    description TEXT,
-    discount_type VARCHAR(30) NOT NULL,
-    discount_value NUMERIC NOT NULL,
-    max_discount NUMERIC,
-    min_ride_amount NUMERIC,
-    start_date TIMESTAMP NOT NULL,
-    end_date TIMESTAMP NOT NULL,
-    usage_limit INTEGER,
-    usage_count INTEGER DEFAULT 0,
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT promotions_discount_type_check CHECK (discount_type IN ('percentage', 'fixed_amount', 'free_ride'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_promotions_code ON promotions(code);
-CREATE INDEX IF NOT EXISTS idx_promotions_dates ON promotions(start_date, end_date);
-
--- Promotion Usage table
-CREATE TABLE IF NOT EXISTS promotion_usage (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    promotion_id UUID NOT NULL REFERENCES promotions(id) ON DELETE RESTRICT,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    ride_id UUID REFERENCES rides(id) ON DELETE SET NULL,
-    discount_amount NUMERIC NOT NULL,
-    used_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_promotion_usage_promotion ON promotion_usage(promotion_id);
-CREATE INDEX IF NOT EXISTS idx_promotion_usage_user ON promotion_usage(user_id);
-
--- ============================================
--- SUPPORT & AUDIT
--- ============================================
-
--- Support Tickets table
-CREATE TABLE IF NOT EXISTS support_tickets (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    ride_id UUID REFERENCES rides(id) ON DELETE SET NULL,
-    category VARCHAR(50) NOT NULL,
-    subject VARCHAR(255) NOT NULL,
-    description TEXT NOT NULL,
-    status VARCHAR(30) NOT NULL DEFAULT 'open',
-    priority VARCHAR(30) NOT NULL DEFAULT 'medium',
-    assigned_to UUID REFERENCES users(id) ON DELETE SET NULL,
-    resolution TEXT,
-    resolved_at TIMESTAMP,
-    closed_at TIMESTAMP,
-    satisfaction_rating INTEGER,
-    attachments JSONB,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT support_tickets_category_check CHECK (category IN ('ride_issue', 'payment_issue', 'account_issue', 'driver_issue', 'passenger_issue', 'other')),
-    CONSTRAINT support_tickets_status_check CHECK (status IN ('open', 'in_progress', 'resolved', 'closed')),
-    CONSTRAINT support_tickets_priority_check CHECK (priority IN ('low', 'medium', 'high', 'urgent')),
-    CONSTRAINT support_tickets_satisfaction_rating_check CHECK (satisfaction_rating BETWEEN 1 AND 5)
-);
-
-CREATE INDEX IF NOT EXISTS idx_ticket_created ON support_tickets(created_at);
-CREATE INDEX IF NOT EXISTS idx_ticket_priority ON support_tickets(priority);
-CREATE INDEX IF NOT EXISTS idx_ticket_ride ON support_tickets(ride_id);
-CREATE INDEX IF NOT EXISTS idx_ticket_status ON support_tickets(status);
-CREATE INDEX IF NOT EXISTS idx_ticket_user ON support_tickets(user_id);
-
--- Audit Logs table
-CREATE TABLE IF NOT EXISTS audit_logs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    actor_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    action VARCHAR(100) NOT NULL,
-    entity_type VARCHAR(100) NOT NULL,
-    entity_id UUID,
-    old_values JSONB,
-    new_values JSONB,
-    ip_address VARCHAR(45),
-    user_agent TEXT,
-    status VARCHAR(20) NOT NULL DEFAULT 'success',
-    failure_reason TEXT,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT audit_logs_status_check CHECK (status IN ('success', 'failure'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
-CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_id);
-CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
-CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type, entity_id);
-
--- ============================================
--- DAILY RESERVATIONS MODULE
--- ============================================
-
--- Daily Reservations table
-CREATE TABLE IF NOT EXISTS daily_reservations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    passenger_id UUID NOT NULL REFERENCES passenger_profiles(id) ON DELETE RESTRICT,
-    driver_id UUID REFERENCES driver_profiles(id) ON DELETE SET NULL,
-    reservation_date DATE NOT NULL,
-    pickup_time TIME NOT NULL,
-    pickup_location TEXT NOT NULL,
-    pickup_latitude NUMERIC NOT NULL,
-    pickup_longitude NUMERIC NOT NULL,
-    trip_type VARCHAR(20) NOT NULL,
-    destination_state VARCHAR(100),
-    estimated_end_time TIME NOT NULL,
-    vehicle_tier VARCHAR(20) DEFAULT 'standard',
-    estimated_distance_km NUMERIC,
-    estimated_duration_hrs NUMERIC,
-    base_fee NUMERIC NOT NULL,
-    fuel_estimate NUMERIC NOT NULL,
-    total_fare_estimate NUMERIC NOT NULL,
-    security_deposit NUMERIC DEFAULT 0.00,
-    final_fare NUMERIC,
-    actual_distance_km NUMERIC,
-    actual_duration_hrs NUMERIC,
-    status VARCHAR(20) DEFAULT 'pending',
-    payment_status VARCHAR(20) DEFAULT 'unpaid',
-    passenger_trust_score NUMERIC,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT daily_reservations_trip_type_check CHECK (trip_type IN ('one_way', 'round_trip', 'hourly', 'interstate')),
-    CONSTRAINT daily_reservations_vehicle_tier_check CHECK (vehicle_tier IN ('standard', 'premium', 'executive')),
-    CONSTRAINT daily_reservations_status_check CHECK (status IN ('pending', 'confirmed', 'in_progress', 'completed', 'cancelled')),
-    CONSTRAINT daily_reservations_payment_status_check CHECK (payment_status IN ('unpaid', 'partial', 'paid', 'refunded'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_daily_res_date ON daily_reservations(reservation_date);
-CREATE INDEX IF NOT EXISTS idx_daily_res_driver ON daily_reservations(driver_id);
-CREATE INDEX IF NOT EXISTS idx_daily_res_passenger ON daily_reservations(passenger_id);
-
--- Daily Reservation Bids table
-CREATE TABLE IF NOT EXISTS daily_reservation_bids (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    reservation_id UUID NOT NULL REFERENCES daily_reservations(id) ON DELETE RESTRICT,
-    driver_id UUID NOT NULL REFERENCES driver_profiles(id) ON DELETE RESTRICT,
-    bid_amount NUMERIC NOT NULL,
-    driver_notes TEXT,
-    status VARCHAR(20) DEFAULT 'pending',
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT daily_reservation_bids_status_check CHECK (status IN ('pending', 'accepted', 'rejected', 'expired', 'cancelled'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_daily_res_bids_driver ON daily_reservation_bids(driver_id);
-CREATE INDEX IF NOT EXISTS idx_daily_res_bids_reservation ON daily_reservation_bids(reservation_id);
-
--- Daily Reservation Stops table
-CREATE TABLE IF NOT EXISTS daily_reservation_stops (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    reservation_id UUID NOT NULL REFERENCES daily_reservations(id) ON DELETE RESTRICT,
-    stop_order INTEGER NOT NULL,
-    address TEXT NOT NULL,
-    latitude NUMERIC NOT NULL,
-    longitude NUMERIC NOT NULL,
-    stop_type VARCHAR(20) NOT NULL,
-    planned_duration_minutes INTEGER,
-    actual_arrival_time TIMESTAMP,
-    actual_departure_time TIMESTAMP,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    CONSTRAINT daily_reservation_stops_stop_type_check CHECK (stop_type IN ('pickup', 'dropoff', 'rest_stop', 'fuel_stop'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_daily_res_stops_reservation ON daily_reservation_stops(reservation_id);
-
--- ============================================
--- CASH VIOLATIONS MODULE
--- ============================================
-
--- Cash Violations table
-CREATE TABLE IF NOT EXISTS cash_violations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ride_id UUID NOT NULL REFERENCES rides(id) ON DELETE RESTRICT,
-    passenger_id UUID NOT NULL REFERENCES passenger_profiles(id) ON DELETE RESTRICT,
-    driver_id UUID NOT NULL REFERENCES driver_profiles(id) ON DELETE RESTRICT,
-    fare_amount NUMERIC NOT NULL,
-    commission_amount NUMERIC NOT NULL,
-    passenger_deducted BOOLEAN DEFAULT FALSE,
-    driver_suspended BOOLEAN DEFAULT TRUE,
-    driver_reinstated BOOLEAN DEFAULT FALSE,
-    driver_payment_confirmed BOOLEAN DEFAULT FALSE,
-    violation_count INTEGER DEFAULT 1,
-    penalty_level VARCHAR(20) DEFAULT 'first',
-    resolved_at TIMESTAMPTZ,
-    resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT cash_violations_penalty_level_check CHECK (penalty_level IN ('first', 'second', 'third', 'permanent'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_cash_violations_driver ON cash_violations(driver_id);
-CREATE INDEX IF NOT EXISTS idx_cash_violations_ride ON cash_violations(ride_id);
-CREATE INDEX IF NOT EXISTS idx_cash_violations_status ON cash_violations(driver_suspended, driver_reinstated);
+CREATE INDEX IF NOT EXISTS idx_driver_ledger_tx_ledger ON driver_ledger_transactions(driver_ledger_id);
+CREATE INDEX IF NOT EXISTS idx_driver_ledger_tx_created ON driver_ledger_transactions(created_at);
 
 -- ============================================
 -- VIRTUAL ACCOUNTS MODULE
 -- ============================================
 
--- Virtual Accounts table
 CREATE TABLE IF NOT EXISTS virtual_accounts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
@@ -1161,7 +972,6 @@ CREATE INDEX IF NOT EXISTS idx_virtual_accounts_status ON virtual_accounts(statu
 -- BANK TRANSFER EVENTS MODULE
 -- ============================================
 
--- Bank Transfer Events table
 CREATE TABLE IF NOT EXISTS bank_transfer_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     virtual_account_id UUID REFERENCES virtual_accounts(id),
@@ -1176,6 +986,7 @@ CREATE TABLE IF NOT EXISTS bank_transfer_events (
     idempotency_key VARCHAR(100) UNIQUE,
     credited_to_wallet BOOLEAN DEFAULT FALSE,
     wallet_transaction_id UUID,
+    metadata JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -1190,7 +1001,6 @@ CREATE INDEX IF NOT EXISTS idx_bank_transfer_events_idempotency ON bank_transfer
 -- UNMATCHED TRANSFERS MODULE
 -- ============================================
 
--- Unmatched Transfers table
 CREATE TABLE IF NOT EXISTS unmatched_transfers (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     provider VARCHAR(50) NOT NULL,
@@ -1209,10 +1019,37 @@ CREATE INDEX IF NOT EXISTS idx_unmatched_transfers_resolved ON unmatched_transfe
 CREATE INDEX IF NOT EXISTS idx_unmatched_transfers_created ON unmatched_transfers(created_at);
 
 -- ============================================
--- FRAUD CASES MODULE
+-- CASH VIOLATIONS MODULE
 -- ============================================
 
--- Fraud Cases table
+CREATE TABLE IF NOT EXISTS cash_violations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ride_id UUID NOT NULL REFERENCES rides(id) ON DELETE RESTRICT,
+    passenger_id UUID NOT NULL REFERENCES passenger_profiles(id) ON DELETE RESTRICT,
+    driver_id UUID NOT NULL REFERENCES driver_profiles(id) ON DELETE RESTRICT,
+    fare_amount NUMERIC NOT NULL,
+    commission_amount NUMERIC NOT NULL,
+    passenger_deducted BOOLEAN DEFAULT FALSE,
+    driver_suspended BOOLEAN DEFAULT TRUE,
+    driver_reinstated BOOLEAN DEFAULT FALSE,
+    driver_payment_confirmed BOOLEAN DEFAULT FALSE,
+    violation_count INTEGER DEFAULT 1,
+    penalty_level VARCHAR(20) DEFAULT 'first',
+    resolved_at TIMESTAMPTZ,
+    resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT cash_violations_penalty_level_check CHECK (penalty_level IN ('first', 'second', 'third', 'permanent'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_cash_violations_driver ON cash_violations(driver_id);
+CREATE INDEX IF NOT EXISTS idx_cash_violations_ride ON cash_violations(ride_id);
+CREATE INDEX IF NOT EXISTS idx_cash_violations_status ON cash_violations(driver_suspended, driver_reinstated);
+
+-- ============================================
+-- FRAUD CASES MODULE (legacy)
+-- ============================================
+
 CREATE TABLE IF NOT EXISTS fraud_cases (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -1239,7 +1076,6 @@ CREATE INDEX IF NOT EXISTS idx_fraud_user ON fraud_cases(user_id);
 -- DAILY METRICS MODULE
 -- ============================================
 
--- Daily Metrics table
 CREATE TABLE IF NOT EXISTS daily_metrics (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     date DATE NOT NULL UNIQUE,
@@ -1264,7 +1100,6 @@ CREATE INDEX IF NOT EXISTS idx_daily_metrics_date ON daily_metrics(date);
 -- PLATFORM CONFIGURATION
 -- ============================================
 
--- Platform Configuration table
 CREATE TABLE IF NOT EXISTS platform_configuration (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     key VARCHAR(100) NOT NULL UNIQUE,
@@ -1283,7 +1118,6 @@ CREATE INDEX IF NOT EXISTS idx_config_key ON platform_configuration(key);
 -- V2.0 INCENTIVE ECOSYSTEM - PROGRAMME PERIODS
 -- ============================================
 
--- Programme Periods table
 CREATE TABLE IF NOT EXISTS programme_periods (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     year INTEGER NOT NULL,
@@ -1317,7 +1151,6 @@ CREATE INDEX IF NOT EXISTS idx_programme_periods_year ON programme_periods(year)
 -- V2.0 INCENTIVE ECOSYSTEM - PASSENGER QUALIFICATION
 -- ============================================
 
--- Passenger Qualification Registry table
 CREATE TABLE IF NOT EXISTS passenger_qualification_registry (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     passenger_id UUID NOT NULL REFERENCES passenger_profiles(id) ON DELETE RESTRICT,
@@ -1344,7 +1177,6 @@ CREATE INDEX IF NOT EXISTS idx_passenger_qual_status ON passenger_qualification_
 CREATE INDEX IF NOT EXISTS idx_passenger_qual_passenger ON passenger_qualification_registry(passenger_id);
 CREATE INDEX IF NOT EXISTS idx_passenger_qual_fraud ON passenger_qualification_registry(fraud_review_status);
 
--- Passenger Qualification Progress table (PINGRIDE letters)
 CREATE TABLE IF NOT EXISTS passenger_qualification_progress (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     passenger_id UUID NOT NULL REFERENCES passenger_profiles(id) ON DELETE RESTRICT,
@@ -1369,7 +1201,6 @@ CREATE INDEX IF NOT EXISTS idx_passenger_progress_period ON passenger_qualificat
 -- V2.0 INCENTIVE ECOSYSTEM - DRIVER QUALIFICATION
 -- ============================================
 
--- Driver Qualification Registry table
 CREATE TABLE IF NOT EXISTS driver_qualification_registry (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     driver_id UUID NOT NULL REFERENCES driver_profiles(id) ON DELETE RESTRICT,
@@ -1396,7 +1227,6 @@ CREATE INDEX IF NOT EXISTS idx_driver_qual_status ON driver_qualification_regist
 CREATE INDEX IF NOT EXISTS idx_driver_qual_driver ON driver_qualification_registry(driver_id);
 CREATE INDEX IF NOT EXISTS idx_driver_qual_fraud ON driver_qualification_registry(fraud_review_status);
 
--- Driver Qualification Progress table (PINGRIDE letters)
 CREATE TABLE IF NOT EXISTS driver_qualification_progress (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     driver_id UUID NOT NULL REFERENCES driver_profiles(id) ON DELETE RESTRICT,
@@ -1421,7 +1251,6 @@ CREATE INDEX IF NOT EXISTS idx_driver_progress_period ON driver_qualification_pr
 -- V2.0 INCENTIVE ECOSYSTEM - REBATE FUND
 -- ============================================
 
--- Rebate Fund Balance table
 CREATE TABLE IF NOT EXISTS rebate_fund_balance (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     programme_period_id UUID NOT NULL REFERENCES programme_periods(id) ON DELETE RESTRICT,
@@ -1440,7 +1269,6 @@ CREATE TABLE IF NOT EXISTS rebate_fund_balance (
 
 CREATE INDEX IF NOT EXISTS idx_rebate_balance_period ON rebate_fund_balance(programme_period_id);
 
--- Rebate Fund Contributions table
 CREATE TABLE IF NOT EXISTS rebate_fund_contributions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     ride_id UUID NOT NULL REFERENCES rides(id) ON DELETE RESTRICT,
@@ -1459,7 +1287,6 @@ CREATE INDEX IF NOT EXISTS idx_rebate_contrib_period ON rebate_fund_contribution
 CREATE INDEX IF NOT EXISTS idx_rebate_contrib_passenger ON rebate_fund_contributions(passenger_id);
 CREATE INDEX IF NOT EXISTS idx_rebate_contrib_ride ON rebate_fund_contributions(ride_id);
 
--- Rebate Allocations table
 CREATE TABLE IF NOT EXISTS rebate_allocations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     passenger_id UUID NOT NULL REFERENCES passenger_profiles(id) ON DELETE RESTRICT,
@@ -1483,7 +1310,6 @@ CREATE INDEX IF NOT EXISTS idx_rebate_alloc_period ON rebate_allocations(program
 CREATE INDEX IF NOT EXISTS idx_rebate_alloc_passenger ON rebate_allocations(passenger_id);
 CREATE INDEX IF NOT EXISTS idx_rebate_alloc_status ON rebate_allocations(allocation_status);
 
--- Rebate Credits table
 CREATE TABLE IF NOT EXISTS rebate_credits (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     passenger_id UUID NOT NULL REFERENCES passenger_profiles(id) ON DELETE RESTRICT,
@@ -1503,7 +1329,6 @@ CREATE INDEX IF NOT EXISTS idx_rebate_credit_passenger ON rebate_credits(passeng
 CREATE INDEX IF NOT EXISTS idx_rebate_credit_status ON rebate_credits(status);
 CREATE INDEX IF NOT EXISTS idx_rebate_credit_expiry ON rebate_credits(expires_at);
 
--- Rebate Credit Usage table
 CREATE TABLE IF NOT EXISTS rebate_credit_usage (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     credit_id UUID NOT NULL REFERENCES rebate_credits(id) ON DELETE RESTRICT,
@@ -1523,7 +1348,6 @@ CREATE INDEX IF NOT EXISTS idx_rebate_usage_passenger ON rebate_credit_usage(pas
 -- V2.0 INCENTIVE ECOSYSTEM - WINNERS
 -- ============================================
 
--- Winners table
 CREATE TABLE IF NOT EXISTS winners (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
@@ -1552,7 +1376,6 @@ CREATE INDEX IF NOT EXISTS idx_winners_period_status ON winners(programme_period
 -- V2.0 INCENTIVE ECOSYSTEM - FRAUD & EXCLUSIONS
 -- ============================================
 
--- Incentive Fraud Cases table
 CREATE TABLE IF NOT EXISTS incentive_fraud_cases (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     programme_period_id UUID NOT NULL REFERENCES programme_periods(id) ON DELETE RESTRICT,
@@ -1587,7 +1410,6 @@ CREATE INDEX IF NOT EXISTS idx_fraud_cases_driver ON incentive_fraud_cases(drive
 CREATE INDEX IF NOT EXISTS idx_fraud_cases_detected ON incentive_fraud_cases(detected_at);
 CREATE INDEX IF NOT EXISTS idx_fraud_cases_suspicion ON incentive_fraud_cases(suspicion_score);
 
--- Qualification Exclusions table
 CREATE TABLE IF NOT EXISTS qualification_exclusions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     programme_period_id UUID NOT NULL REFERENCES programme_periods(id) ON DELETE RESTRICT,
@@ -1620,7 +1442,7 @@ RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.last_location_latitude IS NOT NULL AND NEW.last_location_longitude IS NOT NULL THEN
     NEW.location_geo = ST_SetSRID(
-      ST_MakePoint(NEW.last_location_longitude, NEW.last_location_latitude), 
+      ST_MakePoint(NEW.last_location_longitude, NEW.last_location_latitude),
       4326
     )::geography;
   END IF;

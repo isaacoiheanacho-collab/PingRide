@@ -25,6 +25,10 @@ const submitBidSchema = Joi.object({
   driver_notes: Joi.string().optional(),
 });
 
+const cancelRideRequestSchema = Joi.object({
+  reason: Joi.string().max(500).optional(),
+});
+
 // ============================================
 // PASSENGER ROUTES
 // ============================================
@@ -49,6 +53,14 @@ router.post(
   authenticate,
   requireVerified(),
   marketplaceController.selectBid.bind(marketplaceController)
+);
+
+router.patch(
+  '/requests/:rideRequestId/cancel',
+  authenticate,
+  requireVerified(),
+  validate(cancelRideRequestSchema),
+  marketplaceController.cancelRideRequest.bind(marketplaceController)
 );
 
 router.get(

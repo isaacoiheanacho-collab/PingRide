@@ -29,7 +29,7 @@ export class MarketplaceService {
       const result = await pool.query(
         "SELECT value FROM platform_configuration WHERE key = 'bidding_window_seconds'"
       );
-      
+
       if (result.rows.length > 0) {
         const config = result.rows[0].value;
         const parsedConfig = typeof config === 'string' ? JSON.parse(config) : config;
@@ -188,6 +188,68 @@ export class MarketplaceService {
       selectedBid: result.selected,
       rejectedBids: result.rejected,
       message: 'Driver selected successfully',
+    };
+  }
+
+  /**
+   * Cancel a ride request (passenger, own request only).
+   *
+   * Only cancellable while status is 'pending' or 'bidding'. Once a bid is
+   * selected (status='assigned'), the ride exists and cancellation must go
+   * through RideService.cancelRide instead.
+   *
+   * @param passengerUserId  users.id of the requester
+   * @param rideRequestId    ride_requests.id
+   * @param reason           optional free-text reason
+   */
+  static async cancelRideRequest(
+    passengerUserId: string,
+    rideRequestId: string,
+    reason?: string
+  ): Promise<any> {
+    // 1. Load passenger profile (maps users.id -> passenger_profiles.id)
+    const passenger = await PassengerModel.getProfile(passengerUserId);
+    if (!passenger) {
+      throw new ValidationError('Passenger profile not found');
+    }
+
+    // 2. Load the ride request
+    const rideRequest = await RideRequestModel.getById(rideRequestId);
+    if (!rideRequest) {
+      throw new NotFoundError('Ride request not found');
+    }
+
+    // 3. Ownership check
+    if (rideRequest.passenger_id !== passenger.id) {
+      throw new ValidationError('You do not own this ride request');
+    }
+
+    // 4. State check — only pending or bidding can be cancelled here
+    if (rideRequest.status !== 'pending' && rideRequest.status !== 'bidding') {
+      throw new ValidationError(
+        `Ride request cannot be cancelled in ${rideRequest.status} state`
+      );
+    }
+
+    // 5. Update — RideRequestModel.updateStatus handles cancelled_by
+    //    and cancelled_at as a side effect when cancelled_by is set.
+    const updated = await RideRequestModel.updateStatus(rideRequestId, 'cancelled', {
+      cancelled_by: 'passenger',
+      cancellation_reason: reason || 'Cancelled by passenger',
+    });
+
+    if (!updated) {
+      throw new ValidationError('Failed to cancel ride request');
+    }
+
+    logger.info(
+      `Ride request cancelled: ${rideRequestId} by passenger ${passenger.id}` +
+      (reason ? ` — ${reason}` : '')
+    );
+
+    return {
+      rideRequest: updated,
+      message: 'Ride request cancelled successfully',
     };
   }
 

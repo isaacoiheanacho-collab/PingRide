@@ -5,9 +5,14 @@ import logger from '../utils/logger';
 export class RideModel {
   /**
    * Create a ride from selected bid
+   *
+   * The ride_request_id is stored alongside the ride so that RideService can
+   * cascade terminal status (ride_completed / cancelled) back to the parent
+   * ride_request. Without this link, the ride request stays in 'assigned'
+   * forever and hasActiveRide() blocks the passenger from requesting again.
    */
   static async createFromBid(
-    _rideRequestId: string,  // Prefixed with _ to indicate intentionally unused
+    rideRequestId: string,
     passengerId: string,
     driverId: string,
     bidId: string,
@@ -21,17 +26,19 @@ export class RideModel {
   ): Promise<IRide> {
     const query = `
       INSERT INTO rides (
+        ride_request_id,
         passenger_id, driver_id, bid_id, bid_amount,
         pickup_latitude, pickup_longitude, pickup_address,
         destination_latitude, destination_longitude, destination_address,
         timezone_id, status, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
       RETURNING *
     `;
-    
+
     const timezoneId = 'Africa/Lagos'; // Default, can be made dynamic from ride request
-    
+
     const values = [
+      rideRequestId,
       passengerId,
       driverId,
       bidId,

@@ -82,6 +82,28 @@ export class MarketplaceController {
     });
   }
 
+  async cancelRideRequest(req: AuthRequest, res: Response): Promise<Response> {
+    const userId = req.user?.id;
+    if (!userId) {
+      return ApiResponseHandler.unauthorized(res, 'Not authenticated');
+    }
+
+    const { rideRequestId } = req.params;
+    const rideRequestIdStr = Array.isArray(rideRequestId) ? rideRequestId[0] : rideRequestId;
+
+    const { reason } = req.body;
+
+    const result = await MarketplaceService.cancelRideRequest(
+      userId,
+      rideRequestIdStr,
+      reason
+    );
+
+    return ApiResponseHandler.success(res, result, {
+      message: result.message,
+    });
+  }
+
   async getActiveRideForPassenger(req: AuthRequest, res: Response): Promise<Response> {
     const userId = req.user?.id;
     if (!userId) {

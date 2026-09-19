@@ -228,6 +228,64 @@ export class RideService {
   }
 
   /**
+   * Cascade a ride's terminal status back to its parent ride_request.
+   *
+   * When a ride reaches 'ride_completed' or is 'cancelled', the
+   * ride_requests row that birthed it must also move to a terminal state.
+   * Otherwise hasActiveRide() sees the request as still active and the
+   * passenger is permanently locked out of requesting another ride (bug #17).
+   *
+   * Silently no-ops if rideRequestId is null (legacy rows created before
+   * bug #18 was fixed).
+   *
+   * Note on the ::text casts: Postgres infers parameter types from usage.
+   * Without explicit casts, using $1 in both a CASE comparison and a
+   * SET column triggers "inconsistent types deduced for parameter $1".
+   * The casts make the intent explicit and avoid the error.
+   */
+  private static async cascadeRideRequestStatus(
+    rideRequestId: string | null,
+    newStatus: 'completed' | 'cancelled',
+    reason?: string
+  ): Promise<void> {
+    if (!rideRequestId) {
+      logger.warn(
+        `cascadeRideRequestStatus: ride has no ride_request_id — cannot cascade to '${newStatus}'`
+      );
+      return;
+    }
+
+    try {
+      const result = await pool.query(
+        `UPDATE ride_requests
+         SET status = $1::text,
+             cancelled_by = CASE WHEN $1::text = 'cancelled' THEN 'system' ELSE cancelled_by END,
+             cancelled_at = CASE WHEN $1::text = 'cancelled' THEN NOW() AT TIME ZONE 'UTC' ELSE cancelled_at END,
+             cancellation_reason = CASE WHEN $1::text = 'cancelled' AND $2::text IS NOT NULL THEN $2::text ELSE cancellation_reason END,
+             updated_at = NOW() AT TIME ZONE 'UTC'
+         WHERE id = $3
+           AND status NOT IN ('cancelled', 'expired')`,
+        [newStatus, reason || null, rideRequestId]
+      );
+
+      if ((result.rowCount ?? 0) > 0) {
+        logger.info(`Ride request ${rideRequestId} cascaded to '${newStatus}'`);
+      } else {
+        logger.debug(
+          `Ride request ${rideRequestId} cascade to '${newStatus}' — no rows updated (already terminal or not found)`
+        );
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      logger.error(
+        `Failed to cascade ride request ${rideRequestId} to '${newStatus}': ${msg}`
+      );
+      // Don't throw — the ride status already updated successfully.
+      // Cascade failure should not fail the ride completion.
+    }
+  }
+
+  /**
    * Update ride status (driver side)
    *
    * On 'ride_completed', updates driver stats, passenger ride count, and
@@ -278,7 +336,7 @@ export class RideService {
     const updatedRide = await RideModel.updateStatus(rideId, statusData.status);
 
     // ============================================
-    // RIDE COMPLETION — STATS ONLY
+    // RIDE COMPLETION — STATS + CASCADE
     // ============================================
     if (statusData.status === 'ride_completed') {
       // Update driver earnings aggregate
@@ -301,6 +359,9 @@ export class RideService {
         await PassengerModel.incrementRideCount(passengerUserId);
         await PassengerModel.updateLifetimeSpend(passengerUserId, ride.bid_amount || 0);
       }
+
+      // Cascade terminal status to the parent ride_request (bug #17 fix).
+      await this.cascadeRideRequestStatus(ride.ride_request_id ?? null, 'completed');
 
       // Qualification, rebate contribution, and programme-period association
       // are handled by PaymentService when the ride payment succeeds. Do not
@@ -393,11 +454,12 @@ export class RideService {
     // Update ride status
     const updatedRide = await RideModel.updateStatus(rideId, 'cancelled');
 
-    // Update ride request status
-    await RideRequestModel.updateStatus(ride.ride_request_id, 'cancelled', {
-      cancelled_by: userType,
-      cancellation_reason: reason || 'Cancelled by ' + userType,
-    });
+    // Cascade to ride request (bug #17 + #18 fix).
+    await this.cascadeRideRequestStatus(
+      ride.ride_request_id ?? null,
+      'cancelled',
+      reason || `Cancelled by ${userType}`
+    );
 
     // Mark ride as NOT eligible for qualification on cancellation
     if (ride.programme_period_id) {

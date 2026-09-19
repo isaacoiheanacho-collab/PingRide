@@ -118,6 +118,11 @@ const EXPECTED_COLUMNS: Record<string, readonly string[]> = {
     'rebate_credit_balance',
     'promotional_balance',
   ],
+  rides: [
+    // Bug #18 fix — links a ride back to its parent ride_request so
+    // RideService.updateRideStatus can cascade terminal status.
+    'ride_request_id',
+  ],
 };
 
 // ============================================
