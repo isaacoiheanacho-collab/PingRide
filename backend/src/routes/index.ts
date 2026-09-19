@@ -42,6 +42,9 @@ import adminKycReviewRoutes from './admin-kyc-review.routes';
 // ✅ NDPA Consent (onboarding consent recording)
 import onboardingConsentRoutes from './onboarding-consent.routes';
 
+// ✅ Admin Ride Request Maintenance (sweep stale requests + orphaned bids)
+import adminRideRequestRoutes from './admin-ride-request.routes';
+
 const router = Router();
 const healthController = new HealthController();
 
@@ -146,6 +149,14 @@ v1Router.use('/onboarding/driver/vehicle', onboardingVehicleRoutes);
 // Admin KYC review queue (manual review for identity + vehicle compliance)
 // Mounted under /admin/kyc
 v1Router.use('/admin/kyc', adminKycReviewRoutes);
+
+// ============================================
+// ADMIN RIDE REQUEST MAINTENANCE
+// ============================================
+
+// On-demand sweep of stale ride requests and their orphaned bids.
+// Mounted under /admin/ride-requests
+v1Router.use('/admin/ride-requests', adminRideRequestRoutes);
 
 // Mount v1 routes
 router.use('/api/v1', v1Router);

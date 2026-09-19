@@ -156,6 +156,27 @@ export class RideRequestModel {
   }
 
   static async hasActiveRide(userId: string): Promise<boolean> {
+    // Self-heal: expire this passenger's own stale 'bidding' requests before
+    // checking. A request whose bidding window has closed is dead — it should
+    // not count as active. This runs only when the passenger is trying to
+    // request a new ride, so there is no background CPU cost.
+    //
+    // Bids belonging to the expired request are intentionally left alone here;
+    // the admin sweep (POST /admin/ride-requests/sweep) cascades them to
+    // 'expired'. Self-healing bids inline would mean opening a second
+    // transaction on the hot path, which we do not want.
+    await pool.query(
+      `UPDATE ride_requests rr
+       SET status = 'expired', updated_at = NOW() AT TIME ZONE 'UTC'
+       FROM passenger_profiles p
+       WHERE rr.passenger_id = p.id
+         AND p.user_id = $1
+         AND rr.status = 'bidding'
+         AND rr.bidding_ends_at IS NOT NULL
+         AND rr.bidding_ends_at < NOW() AT TIME ZONE 'UTC'`,
+      [userId]
+    );
+
     const query = `
       SELECT 1 FROM ride_requests r
       JOIN passenger_profiles p ON r.passenger_id = p.id
