@@ -430,8 +430,17 @@ export class DriverService {
 
     await DriverModel.updateStatus(driverId, 'active');
 
+    // Re-fetch after both writes so the response reflects the final DB state.
+    // The snapshot captured in `updated` is from before the driver_status
+    // flip, so returning it would show driver_status as 'pending' even
+    // though the DB has been updated to 'active'.
+    const fresh = await DriverModel.getById(driverId);
+    if (!fresh) {
+      throw new NotFoundError('Driver not found after KYC approval');
+    }
+
     logger.info(`KYC approved for driver: ${driverId} by admin: ${adminId}`);
-    return updated;
+    return fresh;
   }
 
   /**
