@@ -67,16 +67,23 @@ export class MarketplaceService {
     // Create ride request using passenger_profiles.id
     const rideRequest = await RideRequestModel.create(passenger.id, data, biddingWindowSeconds);
 
-    // Start bidding with the configured window
-    await RideRequestModel.startBidding(rideRequest.id, biddingWindowSeconds);
+    // Start bidding with the configured window.
+    // startBidding does an UPDATE ... RETURNING *, so its return value is the
+    // row with bidding_started_at and bidding_ends_at populated. The earlier
+    // `rideRequest` object does not have those fields set (create() does not
+    // write them), so we use bidStarted as the source of truth from here on.
+    const bidStarted = await RideRequestModel.startBidding(rideRequest.id, biddingWindowSeconds);
+    if (!bidStarted) {
+      throw new ValidationError('Failed to start bidding window');
+    }
 
-    const broadcastResult = await BidEngineService.broadcastRide(rideRequest.id);
+    const broadcastResult = await BidEngineService.broadcastRide(bidStarted.id);
 
     return {
-      rideRequest,
+      rideRequest: bidStarted,
       broadcast: broadcastResult,
       message: 'Ride request created successfully. Bidding window is open.',
-      bidding_ends_at: rideRequest.bidding_ends_at,
+      bidding_ends_at: bidStarted.bidding_ends_at,
       timezone: timezoneId,
     };
   }
