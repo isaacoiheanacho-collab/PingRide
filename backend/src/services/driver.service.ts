@@ -428,9 +428,16 @@ export class DriverService {
       await KYCModel.updateStatus(kycRecord.id, 'approved');
     }
 
-    await DriverModel.updateStatus(driverId, 'active');
+    // Flip driver_status to 'active'. Null-check the write so we never
+    // return success when the row was not actually updated (matched zero
+    // rows, blocked by a trigger, wrong id, etc.). Silent partial failure
+    // was the class of bug this guarded against (bug #5).
+    const activated = await DriverModel.updateStatus(driverId, 'active');
+    if (!activated) {
+      throw new ValidationError('KYC approved but failed to activate driver');
+    }
 
-    // Re-fetch after both writes so the response reflects the final DB state.
+    // Re-fetch after all writes so the response reflects the final DB state.
     // The snapshot captured in `updated` is from before the driver_status
     // flip, so returning it would show driver_status as 'pending' even
     // though the DB has been updated to 'active'.
