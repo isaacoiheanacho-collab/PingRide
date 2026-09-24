@@ -12,8 +12,9 @@ import logger from '../utils/logger';
  * exist at all.
  *
  * Endpoints:
- *   POST /dev-emit          → triggers an EventBus emit to the caller
- *   POST /dev-emit-to-room  → triggers an emit to an arbitrary room
+ *   POST /dev-emit            → triggers an EventBus emit to the caller
+ *   POST /dev-emit-to-room    → triggers an emit to an arbitrary room
+ *   GET  /dev-driver-location → inspects cached driver location in Redis
  *
  * If you add more dev-only routes, they go here, and they inherit the
  * production gate below.
@@ -40,6 +41,12 @@ if (env.nodeEnv !== 'production') {
     authenticate,
     requireVerified(),
     controller.devEmitToRoom.bind(controller)
+  );
+  router.get(
+    '/dev-driver-location/:driverUserId',
+    authenticate,
+    requireVerified(),
+    controller.devGetDriverLocation.bind(controller)
   );
 } else {
   logger.warn(

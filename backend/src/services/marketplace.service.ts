@@ -7,6 +7,8 @@ import { VehicleModel } from '../models/vehicle.model';
 import BidEngineService from './bid-engine.service';
 import { EventBus } from '../realtime/event.bus';
 import { broadcastGeohashes } from '../realtime/driver-location';
+import { getIO } from '../realtime/socket.server';
+import { ConnectionManager } from '../realtime/connection.manager';
 import { ICreateRideRequest, ICreateBid } from '../types';
 import { NotFoundError, ValidationError, ConflictError } from '../middleware/error.middleware';
 import logger from '../utils/logger';
@@ -291,12 +293,100 @@ export class MarketplaceService {
 
     logger.info(`Bid selected: ${bidId} for ride ${rideRequestId}`);
 
+    // ============================================
+    // REALTIME — move both parties' sockets into ride:{rideId}
+    // ============================================
+    // Once a ride exists, the passenger and driver need a shared room
+    // for ride-state events (driver:location, ride:driver_arrived,
+    // ride:started, ride:completed, etc.). Both sockets join the room
+    // here. Non-blocking: a socket that is disconnected, backgrounded,
+    // or never opened is skipped without failing selectBid.
+    try {
+      await this.joinRideRoom(
+        ride.id,
+        passengerUserId,
+        bid.driver_id,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      logger.error(
+        `selectBid: failed to join ride room ${ride.id}: ${msg}`
+      );
+      // Swallow — the ride is created and the HTTP response still succeeds.
+      // The sockets will be picked up on the next selectBid/refresh cycle,
+      // and mobile clients can recover the room by re-joining on reconnect.
+    }
+
     return {
       ride,
       selectedBid: result.selected,
       rejectedBids: result.rejected,
       message: 'Driver selected successfully',
     };
+  }
+
+  // ============================================
+  // RIDE ROOM MEMBERSHIP
+  // ============================================
+  /**
+   * Move every connected socket belonging to the passenger and the
+   * driver into `ride:{rideId}`.
+   *
+   * - `passengerUserId` is `users.id` (from the JWT).
+   * - `driverProfileId` is `driver_profiles.id`. We resolve its
+   *   `user_id` to find the driver's sockets in `user:{userId}`.
+   *
+   * Non-blocking. If the socket server is not yet initialised, or a
+   * user has no connected sockets, this logs at debug and returns.
+   * A selectBid call never fails because of a socket-layer issue.
+   */
+  private static async joinRideRoom(
+    rideId: string,
+    passengerUserId: string,
+    driverProfileId: string,
+  ): Promise<void> {
+    let io;
+    try {
+      io = getIO();
+    } catch {
+      logger.debug(
+        `joinRideRoom: socket server not initialised, skipping room join for ride ${rideId}`
+      );
+      return;
+    }
+    // Resolve the driver's users.id from the driver_profiles.id.
+    const driverRow = await pool.query<{ user_id: string }>(
+      'SELECT user_id FROM driver_profiles WHERE id = $1',
+      [driverProfileId]
+    );
+    const driverUserId = driverRow.rows[0]?.user_id;
+    if (!driverUserId) {
+      logger.warn(
+        `joinRideRoom: driver_profiles row ${driverProfileId} not found — ride ${rideId} driver socket not joined`
+      );
+      return;
+    }
+    const cm = new ConnectionManager(io);
+    // Collect every socket for both users.
+    const participantUserIds = [passengerUserId, driverUserId];
+    let totalJoined = 0;
+    for (const userId of participantUserIds) {
+      const socketIds = io.sockets.adapter.rooms.get(`user:${userId}`);
+      if (!socketIds || socketIds.size === 0) {
+        logger.debug(
+          `joinRideRoom: no active sockets for user ${userId} — ride ${rideId}`
+        );
+        continue;
+      }
+      for (const socketId of socketIds) {
+        cm.joinRide(socketId, rideId);
+        totalJoined += 1;
+      }
+    }
+    logger.info(
+      `Ride ${rideId} room membership: ${totalJoined} socket(s) joined from ` +
+      `passenger ${passengerUserId} + driver ${driverUserId}`
+    );
   }
 
   /**

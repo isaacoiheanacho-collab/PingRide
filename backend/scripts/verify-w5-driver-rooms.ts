@@ -2,11 +2,11 @@
  * W5 Step 3 verification.
  *
  * Proves four things end-to-end:
- *   1. Driver online WITH location   → socket receives a broadcast aimed
- *                                     at the geohash room.
- *   2. Driver offline                → socket stops receiving those broadcasts.
+ *   1. Driver online WITH location    → socket receives a broadcast aimed
+ *                                       at the geohash room.
+ *   2. Driver offline                 → socket stops receiving those broadcasts.
  *   3. Driver online WITHOUT location → 422 "Location is required to go online"
- *   4. Full bidding loop             → driver receives ride:requested & passenger receives ride:bid_received
+ *   4. Full bidding loop              → driver receives ride:requested & passenger receives ride:bid_received
  *
  * Run with:  npx ts-node --transpile-only scripts/verify-w5-driver-rooms.ts
  */
@@ -23,6 +23,9 @@ const DRIVER_PHONE = '+2347012345698';
 const DRIVER_PASSWORD = 'Test02!A';
 const DRIVER_LAT = 6.5244;
 const DRIVER_LNG = 3.3792;
+
+const IBADAN_LAT = 7.3775;
+const IBADAN_LNG = 3.9470;
 
 const PASSENGER_PHONE = '+2349012345678';
 const PASSENGER_PASSWORD = 'Test01!A';
@@ -312,6 +315,153 @@ async function main() {
       'ride:bid_received payload has the expected shape',
       `ride:bid_received payload is missing fields: ${JSON.stringify(bidReceived)}`
     );
+  }
+
+  // ============================================
+  // TEST 5 — Driver location update: cached in Redis
+  // ============================================
+  log.step('TEST 5 — Driver location update cached');
+  socket.emit('driver:location_update', {
+    lat: IBADAN_LAT,
+    lng: IBADAN_LNG,
+    heading: 45,
+    speedKmh: 12,
+    recordedAt: new Date().toISOString(),
+  });
+  await new Promise((r) => setTimeout(r, 1000));
+  const cacheRes = await axios.get(
+    `${BASE_URL}/api/v1/realtime/dev-driver-location/${userId}`,
+    authHeader
+  );
+  assert(
+    cacheRes.data.data.cached === true,
+    `Redis cache populated — lat=${cacheRes.data.data.value?.lat}, lng=${cacheRes.data.data.value?.lng}`,
+    'Redis cache NOT populated'
+  );
+  assert(
+    cacheRes.data.data.value?.lat === IBADAN_LAT &&
+      cacheRes.data.data.value?.lng === IBADAN_LNG,
+    'Cached coordinates match sent coordinates',
+    `Coordinates mismatch: expected (${IBADAN_LAT}, ${IBADAN_LNG}), got (${cacheRes.data.data.value?.lat}, ${cacheRes.data.data.value?.lng})`
+  );
+
+  // ============================================
+  // TEST 6 — Lagos coordinates rejected
+  // ============================================
+  log.step('TEST 6 — Lagos coordinates rejected');
+  await new Promise((r) => setTimeout(r, 3500));
+  socket.emit('driver:location_update', {
+    lat: 6.5244,
+    lng: 3.3792,
+    heading: 90,
+    speedKmh: 20,
+    recordedAt: new Date().toISOString(),
+  });
+  await new Promise((r) => setTimeout(r, 1000));
+  const lagosRes = await axios.get(
+    `${BASE_URL}/api/v1/realtime/dev-driver-location/${userId}`,
+    authHeader
+  );
+  assert(
+    lagosRes.data.data.value?.lat === IBADAN_LAT,
+    'Lagos coords rejected — cache still holds last valid Ibadan location',
+    `Lagos exclusion FAILED — cache got updated with lat=${lagosRes.data.data.value?.lat}`
+  );
+
+  // ============================================
+  // TEST 7 — Full W7 path: driver location → ride room → passenger
+  // ============================================
+  //  
+  // This is the test that closes W7 item 3. It completes the ride  
+  // flow (select the bid → ride row created → both sockets join  
+  // ride:{rideId}), then the driver sends a location update and the  
+  // passenger asserts receipt.  
+  //  
+  // Depends on: TEST 4's rideRequestId and bidReceived.bidId being  
+  // valid and the bid still being in 'pending' state.  
+  //  
+  // Requirement: the ride must be created BEFORE the driver's location  
+  // update, otherwise the handler finds no active ride and forwards  
+  // nothing.  
+  log.step('TEST 7 — Driver location forwarded to passenger');
+  if (!rideRequestId || !bidReceived?.bidId) {
+    log.fail(
+      'TEST 7 cannot run — missing rideRequestId or bidId from TEST 4'
+    );
+    process.exitCode = 1;
+  } else {
+    // -- 7a. Passenger selects the bid (this creates the ride) --
+    log.info(
+      `Selecting bid ${bidReceived.bidId} on ride request ${rideRequestId}…`
+    );
+    const selectRes = await axios.post(
+      `${BASE_URL}/api/v1/marketplace/requests/${rideRequestId}/bids/${bidReceived.bidId}/select`,
+      {},
+      passengerAuthHeader
+    );
+    const rideId: string = selectRes.data.data.ride.id;
+    log.pass(`Ride created: ${rideId}`);
+    // -- 7b. Give the room-join a beat --
+    await new Promise((r) => setTimeout(r, 800));
+    // -- 7c. Passenger attaches the driver:location listener --
+    // Must be attached BEFORE the driver emits, otherwise the event
+    // races past.
+    const receiveDriverLocation = waitForEvent(
+      passengerSocket,
+      'driver:location',
+      5000
+    );
+    // -- 7d. Driver emits driver:location_update --
+    // Ibadan coordinates — inside Nigeria, outside Lagos. Must be
+    // different from the TEST 5 coordinates so we can distinguish
+    // the payload from any leftover cache.
+    const TEST7_LAT = 7.3800;
+    const TEST7_LNG = 3.9500;
+    log.info(
+      `Driver emitting driver:location_update with (${TEST7_LAT}, ${TEST7_LNG})`
+    );
+    socket.emit('driver:location_update', {
+      lat: TEST7_LAT,
+      lng: TEST7_LNG,
+      heading: 120,
+      speedKmh: 18,
+      recordedAt: new Date().toISOString(),
+    });
+    // -- 7e. Passenger waits for the forwarded event --
+    const driverLocation = await receiveDriverLocation;
+    if (!driverLocation) {
+      log.fail(
+        'Passenger did NOT receive driver:location within 5s — forwarding path broken'
+      );
+      process.exitCode = 1;
+    } else {
+      // -- 7f. Assert payload --
+      log.pass(
+        `Passenger received driver:location — lat=${driverLocation.lat}, lng=${driverLocation.lng}`
+      );
+      assert(
+        driverLocation.lat === TEST7_LAT &&
+          driverLocation.lng === TEST7_LNG,
+        'Forwarded coordinates match what the driver sent',
+        `Coordinate mismatch: expected (${TEST7_LAT}, ${TEST7_LNG}), got (${driverLocation.lat}, ${driverLocation.lng})`
+      );
+      assert(
+        driverLocation.rideId === rideId,
+        `Payload rideId matches the created ride (${rideId})`,
+        `Payload rideId mismatch: expected ${rideId}, got ${driverLocation.rideId}`
+      );
+      assert(
+        driverLocation.driverId === userId,
+        `Payload driverId matches the authenticated driver (${userId})`,
+        `Payload driverId mismatch: expected ${userId}, got ${driverLocation.driverId}`
+      );
+      assert(
+        typeof driverLocation.recordedAt === 'string' &&
+          !isNaN(Date.parse(driverLocation.recordedAt)),
+        'Payload recordedAt is a valid ISO timestamp',
+        `Payload recordedAt is invalid: ${driverLocation.recordedAt}`
+      );
+    }
   }
 
   passengerSocket.disconnect();

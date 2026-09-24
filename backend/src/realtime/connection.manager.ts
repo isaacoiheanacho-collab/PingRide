@@ -1,6 +1,7 @@
 import { Server as SocketIOServer } from 'socket.io';
 import logger from '../utils/logger';
 import { SocketUser } from './auth.handshake';
+import { registerDriverLocationHandlers } from './driver-location.handlers';
 
 /**
  * Connection Manager — room strategy for PingRide sockets.
@@ -10,10 +11,10 @@ import { SocketUser } from './auth.handshake';
  * join/leave logic so no other file needs to know how rooms are named.
  *
  * Room patterns:
- *   user:{userId}              — personal events for one user
- *   ride:{rideId}              — events visible to passenger + driver
- *   drivers:near:{geohash}     — broadcast ride requests to nearby drivers
- *   admin:monitoring           — live feed for admin portal
+ *   user:{userId}               — personal events for one user
+ *   ride:{rideId}               — events visible to passenger + driver
+ *   drivers:near:{geohash}      — broadcast ride requests to nearby drivers
+ *   admin:monitoring            — live feed for admin portal
  */
 
 // ============================================
@@ -68,6 +69,15 @@ export function registerConnectionHandlers(io: SocketIOServer): void {
       socket.join(adminRoom);
       logger.debug(`Socket ${socket.id} joined room ${adminRoom}`);
     }
+
+    // ==========================================
+    // REGISTER DRIVER-SPECIFIC HANDLERS
+    // ==========================================
+    // Only drivers receive location-update listeners. The registrar is
+    // a no-op for every other role, so calling it unconditionally is
+    // safe — it inspects `socket.user.role` internally and returns
+    // early if the socket does not belong to a driver.
+    registerDriverLocationHandlers(io, socket);
 
     // ==========================================
     // SEND CONNECTED ACK

@@ -62,7 +62,7 @@ export const env = {
   // Cache TTLs
   cacheSessionTtl: parseInt(process.env.CACHE_SESSION_TTL || '86400', 10),
   cacheOtpTtl: parseInt(process.env.CACHE_OTP_TTL || '300', 10),
-  cacheDriverLocationTtl: parseInt(process.env.CACHE_DRIVER_LOCATION_TTL || '60', 10),
+  cacheDriverLocationTtl: parseInt(process.env.CACHE_DRIVER_LOCATION_TTL || '30', 10),
   cacheRideRequestTtl: parseInt(process.env.CACHE_RIDE_REQUEST_TTL || '300', 10),
   cacheConfigTtl: parseInt(process.env.CACHE_CONFIG_TTL || '300', 10),
 

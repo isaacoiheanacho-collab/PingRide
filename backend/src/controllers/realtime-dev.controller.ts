@@ -5,6 +5,7 @@ import { EventBus } from '../realtime/event.bus';
 import { env } from '../config/env';
 import logger from '../utils/logger';
 import { getIO } from '../realtime/socket.server';
+import { DriverLocationService } from '../services/driver-location.service';
 
 /**
  * Realtime Dev Controller — DEVELOPMENT ONLY.
@@ -150,6 +151,35 @@ export class RealtimeDevController {
     });
     logger.info(`dev-emit-to-room: notification → ${room}`);
     return ApiResponseHandler.success(res, { emitted: true, room });
+  }
+
+  /**
+   * GET /api/v1/realtime/dev-driver-location/:driverUserId
+   *
+   * DEV ONLY. Inspects the cached driver location in Redis for verification.
+   */
+  async devGetDriverLocation(req: AuthRequest, res: Response): Promise<Response> {
+    if (env.nodeEnv === 'production') {
+      return ApiResponseHandler.notFound(res, 'Not found');
+    }
+    const authenticatedUserId = req.user?.id;
+    if (!authenticatedUserId) {
+      return ApiResponseHandler.unauthorized(res, 'Not authenticated');
+    }
+    const { driverUserId } = req.params;
+    const driverUserIdStr = Array.isArray(driverUserId) ? driverUserId[0] : driverUserId;
+    if (driverUserIdStr !== authenticatedUserId) {
+      return ApiResponseHandler.forbidden(
+        res,
+        'dev-driver-location may only read the authenticated user'
+      );
+    }
+    const cached = await DriverLocationService.getCachedLocation(driverUserIdStr);
+    return ApiResponseHandler.success(res, {
+      driverUserId: driverUserIdStr,
+      cached: cached !== null,
+      value: cached,
+    });
   }
 }
 
