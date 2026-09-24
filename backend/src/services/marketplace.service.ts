@@ -2,7 +2,11 @@ import { RideRequestModel } from '../models/ride-request.model';
 import { RideBidModel } from '../models/ride-bid.model';
 import { RideModel } from '../models/ride.model';
 import { PassengerModel } from '../models/passenger.model';
+import { DriverModel } from '../models/driver.model';
+import { VehicleModel } from '../models/vehicle.model';
 import BidEngineService from './bid-engine.service';
+import { EventBus } from '../realtime/event.bus';
+import { broadcastGeohashes } from '../realtime/driver-location';
 import { ICreateRideRequest, ICreateBid } from '../types';
 import { NotFoundError, ValidationError, ConflictError } from '../middleware/error.middleware';
 import logger from '../utils/logger';
@@ -79,6 +83,43 @@ export class MarketplaceService {
 
     const broadcastResult = await BidEngineService.broadcastRide(bidStarted.id);
 
+    // ============================================
+    // REALTIME BROADCAST — emit ride:requested to every online driver
+    // in the 9 geohash cells surrounding the pickup point.
+    // ============================================
+    // Geohash precision-5 cells are ~4.9km × 4.9km. Emitting to the
+    // passenger's cell plus its 8 neighbours covers a ~15km × 15km
+    // area — comfortably larger than the 5km search radius configured
+    // in DRIVER_SEARCH_RADIUS_KM. A driver cannot be in two cells at
+    // once, so no duplicate delivery occurs.
+    const geohashes = broadcastGeohashes(
+      bidStarted.pickup_latitude,
+      bidStarted.pickup_longitude
+    );
+    const requestedPayload = {
+      rideRequestId: bidStarted.id,
+      pickup: {
+        lat: bidStarted.pickup_latitude,
+        lng: bidStarted.pickup_longitude,
+        address: bidStarted.pickup_address,
+      },
+      dropoff: {
+        lat: bidStarted.destination_latitude,
+        lng: bidStarted.destination_longitude,
+        address: bidStarted.destination_address,
+      },
+      distanceKm: bidStarted.estimated_distance_km,
+      estimatedDurationMin: bidStarted.estimated_duration_min,
+      biddingEndsAt: bidStarted.bidding_ends_at!.toISOString(),
+    };
+    for (const geohash of geohashes) {
+      EventBus.emitToDriversNear(geohash, 'ride:requested', requestedPayload);
+    }
+    logger.info(
+      `Ride request ${bidStarted.id} broadcast to ${geohashes.length} geohash cells ` +
+      `(centre ${geohashes[0]})`
+    );
+
     return {
       rideRequest: bidStarted,
       broadcast: broadcastResult,
@@ -122,6 +163,66 @@ export class MarketplaceService {
     const bid = await RideBidModel.create(data);
 
     logger.info(`Bid submitted: ${bid.id} for ride ${data.ride_request_id} by driver ${driverId}`);
+
+    // ============================================
+    // REALTIME — emit ride:bid_received to the passenger's user room.
+    // ============================================
+    // Non-blocking. If any lookup or emit fails, the bid is still recorded
+    // in the DB and the driver still gets a success response. The passenger
+    // app can always fetch bids via GET /marketplace/requests/:id — the
+    // socket event is an accelerator, not the source of truth.
+    try {
+      // 1. Resolve the passenger's userId (the room target).
+      //    ride_requests.passenger_id is passenger_profiles.id, not users.id.
+      const passengerRow = await pool.query(
+        'SELECT user_id FROM passenger_profiles WHERE id = $1',
+        [(await RideRequestModel.getById(data.ride_request_id))?.passenger_id]
+      );
+      const passengerUserId: string | undefined = passengerRow.rows[0]?.user_id;
+
+      if (!passengerUserId) {
+        logger.warn(
+          `submitBid: passenger userId not found for ride_request ${data.ride_request_id} — skipping bid_received emit`
+        );
+      } else {
+        // 2. Load driver + vehicle for the display payload.
+        const driver = await DriverModel.getById(driverId);
+        const vehicle = await VehicleModel.getPrimary(driverId);
+
+        // 3. Build the payload to match BidReceivedPayload in events.ts.
+        const payload = {
+          bidId: bid.id,
+          rideRequestId: data.ride_request_id,
+          driverId: driverId,
+          driverDisplayName: driver
+            ? `${driver.first_name} ${driver.last_name}`.trim()
+            : 'Driver',
+          driverRating: driver?.rating_average != null
+            ? parseFloat(String(driver.rating_average))
+            : null,
+          vehicleType: vehicle?.vehicle_type ?? 'standard',
+          vehicleMake: vehicle?.make ?? null,
+          vehicleModel: vehicle?.model ?? null,
+          vehicleRegistration: vehicle?.registration_number ?? null,
+          bidAmount: parseFloat(String(bid.bid_amount)),
+          etaMinutes: bid.eta_minutes,
+          expiresAt: (
+            (await RideRequestModel.getById(data.ride_request_id))?.bidding_ends_at ??
+            new Date()
+          ).toISOString(),
+        };
+
+        EventBus.emitToUser(passengerUserId, 'ride:bid_received', payload);
+        logger.debug(
+          `Emitted ride:bid_received → user:${passengerUserId} (bid ${bid.id})`
+        );
+      }
+    } catch (emitErr) {
+      const msg = emitErr instanceof Error ? emitErr.message : 'Unknown error';
+      logger.error(
+        `submitBid: failed to emit ride:bid_received for bid ${bid.id}: ${msg}`
+      );
+    }
 
     return {
       bid,

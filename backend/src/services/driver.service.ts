@@ -5,6 +5,7 @@ import DriverDocumentModel from '../models/driver-document.model';
 import KYCModel from '../models/kyc.model';
 import { DriverSuspensionModel } from '../models/driver-suspension.model';
 import { SubaccountService } from './subaccount.service';
+import { joinDriverNearRooms, leaveAllDriverNearRooms } from '../realtime/driver-location';
 import {
   IDriverProfile,
   ICreateDriverProfile,
@@ -225,6 +226,23 @@ export class DriverService {
 
     if (!updated) {
       throw new ValidationError('Failed to update availability');
+    }
+
+    // ============================================
+    // REALTIME ROOM MEMBERSHIP
+    // ============================================
+    // Going online requires a location — without coordinates we cannot
+    // compute a geohash, and a driver with no geohash room cannot receive
+    // ride:requested broadcasts. Reject rather than silently succeeding.
+    if (isOnline) {
+      if (!location) {
+        throw new ValidationError(
+          'Location is required to go online'
+        );
+      }
+      joinDriverNearRooms(userId, location.latitude, location.longitude);
+    } else {
+      leaveAllDriverNearRooms(userId);
     }
 
     return updated;

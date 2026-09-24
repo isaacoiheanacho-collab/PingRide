@@ -45,15 +45,25 @@ import onboardingConsentRoutes from './onboarding-consent.routes';
 // ✅ Admin Ride Request Maintenance (sweep stale requests + orphaned bids)
 import adminRideRequestRoutes from './admin-ride-request.routes';
 
+// ✅ [DEV-ONLY] Realtime dev endpoints (auto-disabled in production)
+import realtimeDevRoutes from './realtime-dev.routes';
+
 const router = Router();
 const healthController = new HealthController();
 
-// Health check routes
+// ============================================
+// HEALTH CHECK ROUTES (top-level, no /api prefix)
+// ============================================
 router.get('/health', healthController.health.bind(healthController));
 router.get('/health/ready', healthController.ready.bind(healthController));
 
-// API v1 routes
+// ============================================
+// API v1 ROUTES
+// ============================================
 const v1Router = Router();
+
+// Socket.io health check (versioned path, safely stripped before Socket.io layer)
+v1Router.get('/realtime/health', healthController.socketHealth.bind(healthController));
 
 // Auth routes (public)
 v1Router.use('/auth', authRoutes);
@@ -157,6 +167,13 @@ v1Router.use('/admin/kyc', adminKycReviewRoutes);
 // On-demand sweep of stale ride requests and their orphaned bids.
 // Mounted under /admin/ride-requests
 v1Router.use('/admin/ride-requests', adminRideRequestRoutes);
+
+// ============================================
+// [DEV-ONLY] REALTIME DEV ROUTES
+// ============================================
+// Development-only endpoint for testing EventBus emits.
+// Auto-disabled in production — see realtime-dev.routes.ts
+v1Router.use('/realtime', realtimeDevRoutes);
 
 // Mount v1 routes
 router.use('/api/v1', v1Router);

@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import pool from '../config/database';
 import { getRedisClient } from '../config/redis';
 import logger from '../utils/logger';
+import { isSocketServerReady, getIO } from '../realtime';
 
 export class HealthController {
   async health(_req: Request, res: Response): Promise<Response> {
@@ -39,5 +40,19 @@ export class HealthController {
       logger.error('Ready check failed:', error);
       return ApiResponseHandler.serverError(res, 'Service not ready');
     }
+  }
+
+  async socketHealth(_req: Request, res: Response): Promise<Response> {
+    if (!isSocketServerReady()) {
+      return ApiResponseHandler.error(res, 'SOCKET_NOT_READY', 'Socket.io server not initialized', 503);
+    }
+
+    const io = getIO();
+    return ApiResponseHandler.success(res, {
+      status: 'healthy',
+      connectedSockets: io.engine.clientsCount,
+      namespaces: Array.from(io._nsps.keys()),
+      timestamp: new Date().toISOString(),
+    });
   }
 }

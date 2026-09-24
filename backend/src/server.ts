@@ -1,9 +1,11 @@
+import http from 'http';
 import app from './app';
 import { env } from './config/env';
 import logger from './utils/logger';
 import { testDatabaseConnection } from './config/database';
 import { testRedisConnection } from './config/redis';
 import { verifyDatabase } from './startup/verify-db';
+import { initializeSocketServer } from './realtime';
 
 const PORT = env.port;
 
@@ -43,9 +45,12 @@ async function startServer() {
   }
 
   // ============================================
-  // STEP 4: Start HTTP server
+  // STEP 4: Start HTTP & Socket server
   // ============================================
-  const server = app.listen(PORT, () => {
+  const httpServer = http.createServer(app);
+  initializeSocketServer(httpServer);
+
+  const server = httpServer.listen(PORT, () => {
     logger.info(`✅ Server running on http://localhost:${PORT}`);
     logger.info(`📍 Health check: http://localhost:${PORT}/health`);
     logger.info(`📍 Ready check: http://localhost:${PORT}/health/ready`);
